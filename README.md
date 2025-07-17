@@ -1,0 +1,1 @@
+The code is for the paper "Diffusion Beats Autoregressive in Data-Constrained Settings".
