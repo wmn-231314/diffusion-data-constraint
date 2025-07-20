@@ -8,7 +8,7 @@
 [![Website](https://img.shields.io/badge/🌎-Website-blue.svg)](http://diffusion-scaling.github.io)
 </div>
 
-This is the official implementation of our paper [Diffusion Beats Autoregressive in Data-Constrained Settings](https://diffusion-scaling.github.io/) by 
+This is the official implementation of our paper [Diffusion Beats Autoregressive in Data-Constrained Settings](https://diffusion-scaling.github.io/)
 
 
 <!-- DESCRIPTION -->
