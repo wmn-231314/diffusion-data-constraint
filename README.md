@@ -2,7 +2,7 @@
 
 <!-- TITLE -->
 # **Diffusion Beats Autoregressive in Data-Constrained Settings**
-![Diffusion-scaling](http://diffusion-scaling.github.io/preview.png)
+[![Diffusion-scaling](http://diffusion-scaling.github.io/preview.png)](https://diffusion-scaling.github.io/static/images/preview.png)
 
 [![arXiv](https://img.shields.io/badge/cs.CV-arXiv:2407.08737-b31b1b.svg)]()
 [![Website](https://img.shields.io/badge/🌎-Website-blue.svg)](http://diffusion-scaling.github.io)
