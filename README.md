@@ -4,7 +4,7 @@
 # **Diffusion Beats Autoregressive in Data-Constrained Settings**
 [![Diffusion-scaling](preview.png)](preview.png)
 
-[![arXiv](https://img.shields.io/badge/cs.CV-arXiv:2407.08737-b31b1b.svg)]()
+[![arXiv](https://img.shields.io/badge/cs.CV-arXiv:2507.15857-b31b1b.svg)](https://arxiv.org/abs/2507.15857)
 [![Website](https://img.shields.io/badge/🌎-Website-blue.svg)](http://diffusion-scaling.github.io)
 </div>
 
