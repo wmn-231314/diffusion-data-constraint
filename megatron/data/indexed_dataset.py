@@ -110,12 +110,17 @@ def code(dtype):
             return k
     raise ValueError(dtype)
 
-
-def index_file_path(prefix_path):
+def index_file_path(prefix_path, root=None):
+    if root is not None:
+        file_name = prefix_path + '.idx'
+        return os.path.join(root, file_name)
     return prefix_path + '.idx'
 
 
-def data_file_path(prefix_path):
+def data_file_path(prefix_path, root=None):
+    if root is not None:
+        file_name = prefix_path + '.bin'
+        return os.path.join(root, file_name)
     return prefix_path + '.bin'
 
 

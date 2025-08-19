@@ -12,7 +12,7 @@ from torch.utils import cpp_extension
 # leading to recompilation of fused kernels. Set it to empty string
 # to avoid recompilation and assign arch flags explicity in
 # extra_cuda_cflags below
-os.environ["TORCH_CUDA_ARCH_LIST"] = ""
+# os.environ["TORCH_CUDA_ARCH_LIST"] = "" TODO: don't know why this is needed
 
 
 def load(args):
@@ -37,10 +37,14 @@ def load(args):
         if int(bare_metal_major) >= 12:
             cc_flag.append('-gencode')
             cc_flag.append('arch=compute_90,code=sm_90')
+            if int(bare_metal_minor) >= 8:
+                cc_flag.append('-gencode')
+                cc_flag.append('arch=compute_100,code=sm_100')
 
     # Build path
     srcpath = pathlib.Path(__file__).parent.absolute()
-    buildpath = srcpath / 'build'
+    build_name = os.environ.get('BUILD_NAME', 'build')
+    buildpath = srcpath / build_name
     _create_build_dir(buildpath)
 
     # Helper function to build the kernels.

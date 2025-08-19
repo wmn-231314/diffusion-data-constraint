@@ -15,7 +15,7 @@ from tqdm import tqdm
 import torch.nn.functional as F
 
 from lm_eval.tasks import ALL_TASKS
-from pretrain_gpt import model_provider
+from pretrain_diff_gpt import model_provider
 import numpy as np
 import time
 
@@ -39,7 +39,7 @@ from megatron.model.module import Float16Module
 from deepspeed.runtime.pipe import schedule
 from deepspeed.accelerator import get_accelerator
 
-class EvalHarnessAdaptor(GPT2LM):
+class EvalHarnessDiffAdaptor(GPT2LM):
     def __init__(self, model, tokenizer):
         args = get_args()
         self.args = args
@@ -47,14 +47,20 @@ class EvalHarnessAdaptor(GPT2LM):
         self.tokenizer = tokenizer
         self.VOCAB_SIZE = tokenizer.vocab_size
         self.EOT_TOKEN_ID = tokenizer.eod
+        self.NOISY_MASK_TOKEN_ID = args.padded_vocab_size if args.untie_embeddings_and_output_weights and args.untie_with_additional_mask else tokenizer.vocab_size
 
         self._max_length = args.seq_length
+        self._num_mc = args.num_mc
+        self._max_chunk_size = args.max_chunk_size
+        self.sampling_eps = args.sampling_eps
+        self.only_generate = args.only_generate
+        self.only_mc_nll = args.only_mc_nll
+        
 
         # For ds we split into mini batches and then micro batches to keep pipelining api happy.
         # With Megatron we just go to micro_batches directly
         self._batch_size = args.micro_batch_size
 
-        self.cache_hook = CacheHook(None)
         self.is_main = args.rank == 0
         self.is_local_main = args.local_rank == 0
         self._device = get_accelerator().current_device_name()
@@ -66,6 +72,9 @@ class EvalHarnessAdaptor(GPT2LM):
             raise NotImplementedError("Data parallelism is currently not supported for evaluation")
 
         self.is_last_stage = True if not self.is_pipe_parallel else mpu.is_pipeline_last_stage()  # only the last stage of the pipeline model will receive the logits
+
+        self.eval_method = args.eval_method
+        self._setup_eval_method()
 
         self.model.eval()
 
@@ -80,7 +89,12 @@ class EvalHarnessAdaptor(GPT2LM):
     @property
     def device(self):
         return self._device
-
+    
+    def _setup_eval_method(self):
+        if self.eval_method == 'ar':
+            self.eval_target = self._eval_target_nll_ar
+        elif self.eval_method == 'mc':
+            self.eval_target = self._eval_target_nll_mc
 
     def loglikelihood(self, requests):
         new_reqs = []
@@ -136,11 +150,11 @@ class EvalHarnessAdaptor(GPT2LM):
 
             reord = utils.Reorderer(requests, _collate)
             for chunk in utils.chunks(tqdm(reord.get_reordered(), disable=disable_tqdm), self.batch_size):
-                inps, contlens, inplens, padding_length = [], [], [], None
-                for _, context_enc, continuation_enc in chunk: # text, context_enc(question), continuation_enc(answer)
+                inps, contlens, inplens, mask_positions, padding_length = [], [], [], [], None
+                for cache_key, context_enc, continuation_enc in chunk: # text, context_enc(question), continuation_enc(answer)
                     # when too long to fit in context, truncate from the left
                     inp = torch.tensor(
-                        (context_enc + continuation_enc)[-(self.max_length + 1):][:-1] # next token prediction
+                        (context_enc + continuation_enc)[-self.max_length:] # current token prediction
                         , dtype=torch.long).to(self.device)
                     inplen, = inp.shape
 
@@ -148,40 +162,60 @@ class EvalHarnessAdaptor(GPT2LM):
 
                     # since in _collate we make sure length is descending, the longest is always the first one.
                     padding_length = padding_length if padding_length is not None else inplen
+
                     if not self.adaptive_seq_len:
                         padding_length = self.max_length
-                    # pad to length
-                    inp = torch.cat([
-                        inp,  # [seq]
-                        torch.zeros(padding_length - inplen, dtype=torch.long).to(inp.device)  # [padding_length - seq]
-                    ], dim=0)
 
-                    inps.append(inp.unsqueeze(0))
+                    if padding_length > inplen:
+                        # pad to length
+                        inp = torch.cat([
+                            inp,  # [seq]
+                            torch.full((padding_length - inplen,), self.NOISY_MASK_TOKEN_ID, dtype=torch.long).to(inp.device)  # [padding_length - seq]
+                        ], dim=0)
+                    else:
+                        inp = inp[-padding_length:]
+                        inplen = padding_length
 
-                    contlens.append(cont)
-                    inplens.append(inplen)
-
-                input_ids = torch.cat(inps, dim=0)
-                logits = self._model_call(input_ids)
-                res_len += len(chunk)
-                if logits is not None:
-                    multi_logits = F.log_softmax(logits, dim=-1).cpu()  # [batch, seq, vocab]
-
-                    for (cache_key, _, _), logits, inp, inplen, cont_toks in zip(chunk, multi_logits, inps, inplens, contlens):
-                        contlen = len(cont_toks)
-                        logits = logits[inplen - contlen:inplen].unsqueeze(0)  # [1, seq, vocab]
-                        greedy_tokens = logits.argmax(dim=-1)
-                        # cont_toks :: [1, seq]
-                        cont_toks = torch.tensor(cont_toks, dtype=torch.long).unsqueeze(0)
-                        max_equal = (greedy_tokens == cont_toks).all()
-                        # last_token_slice = logits[:, -1, :].squeeze(0).tolist()
-
-                        logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(-1)  # [1, seq]
-                        answer = (float(logits.sum()), bool(max_equal))
-                        # partial caching
-                        if cache_key is not None:
-                            self.cache_hook.add_partial("loglikelihood", cache_key, answer)
+                    if self.only_generate:
+                        # add mask to inp
+                        inp[inplen - len(cont): inplen + 1] = self.NOISY_MASK_TOKEN_ID
+                        mask_pos = torch.arange(inplen - len(cont), inplen)
+                        inps.append(inp.unsqueeze(0))
+                        contlens.append(cont)
+                        inplens.append(inplen)
+                        mask_positions.append(mask_pos)
+                    else:
+                        # answer is a tuple of (logits target, bool if greedy prediction is correct)
+                        answer = self.eval_target(inp, cont, inplen)
                         res.append(answer)
+                        res_len += 1
+
+                if self.only_generate:
+                    input_ids = torch.cat(inps, dim=0)
+                    batch_size = input_ids.shape[0]
+                    max_step = max(len(cont) for cont in contlens)
+                    for i in range(max_step):
+                        logits = self._model_call(input_ids)
+                        for j in range(batch_size):
+                            mask_index = (input_ids[j] == self.NOISY_MASK_TOKEN_ID) & (torch.arange(input_ids.shape[1], device=self.device) < inplens[j])
+                            if mask_index.sum() == 0:
+                                continue
+                            logits_cur = logits[j, mask_index]
+                            x0 = torch.argmax(logits_cur, dim=-1)
+                            p = torch.softmax(logits_cur.to(torch.float32), dim=-1)
+                            confidence = torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)).squeeze(dim=-1)
+                            _, index = torch.sort(confidence, descending=True)
+                            x0[index[1:]] = self.NOISY_MASK_TOKEN_ID
+                            input_ids[j, mask_index] = x0.clone()
+                        del logits
+                        torch.cuda.empty_cache()
+
+                    for i in range(batch_size):
+                        cont_toks = torch.tensor(contlens[i], dtype=torch.long, device=self.device)
+                        pred_ans = input_ids[i, mask_positions[i]]
+                        max_equal = (pred_ans == cont_toks).all().cpu()
+                        res.append((float(0.0), bool(max_equal))) # ignore nll
+                    res_len += len(chunk)
 
         if not mpu.is_pipeline_last_stage():
             # @HACK: To make the eval harness happy on threads that don't have access to the results.
@@ -190,17 +224,145 @@ class EvalHarnessAdaptor(GPT2LM):
 
         return reord.get_original(res)
 
+    def _eval_target_nll_ar(self, inp, cont_toks, inplen):
+        self.model.eval()
+        target_len = len(cont_toks)
+        all_logits = []
+
+        # Create batch of inputs by repeating and masking different positions
+        # Use chunking to avoid OOM when target_len is too large
+        max_batch_size = self.args.max_chunk_size  # Adjust based on available memory
+        all_logits_list = []
+
+        for chunk_start in range(0, target_len, max_batch_size):
+            chunk_end = min(chunk_start + max_batch_size, target_len)
+            chunk_size = chunk_end - chunk_start
+            
+            batch_inp = inp.unsqueeze(0).repeat(chunk_size, 1)
+            mask_positions = torch.arange(chunk_start, chunk_end)
+            mask_positions = inplen - len(cont_toks) + mask_positions
+
+            for i in range(chunk_size):
+                batch_inp[i, mask_positions[i]: mask_positions[-1] + 1] = self.NOISY_MASK_TOKEN_ID
+                    
+            with torch.no_grad():
+                logits = self._model_call(batch_inp)
+                
+            if logits is not None:
+                # Get logits for masked positions
+                chunk_logits = logits[torch.arange(chunk_size), mask_positions, :]
+                all_logits_list.append(chunk_logits)
+
+        # Concatenate all chunks
+        all_logits = torch.cat(all_logits_list, dim=0)
+        all_logits = all_logits.unsqueeze(0)  # Add batch dimension to match original shape
+        all_logits = F.log_softmax(all_logits, dim=-1)
+        greedy_tokens = all_logits.argmax(dim=-1)
+        cont_toks = torch.tensor(cont_toks, dtype=torch.long, device=self.device).unsqueeze(0)
+        max_equal = (greedy_tokens == cont_toks).all().cpu()
+        logits = torch.gather(all_logits, 2, cont_toks.unsqueeze(-1)).squeeze(-1)
+        answer = (float(logits.sum()), bool(max_equal))
+        return answer
+
+    def _forward_process(self, batch_inp, chunk_start=0, u0=None):
+        b = batch_inp.shape[0]
+        l = batch_inp.shape[1]
+        # sample from U[0, 1] following https://arxiv.org/pdf/2107.00630 I.1
+        if u0 is None:
+            u0 = torch.rand(1, device=self.device, dtype=torch.float32)
+        indices = torch.arange(b, device=self.device).float() + chunk_start
+        t = (u0 + indices / self._num_mc) % 1
+
+        p_mask = (1 - self.sampling_eps) * t + self.sampling_eps
+        p_mask = p_mask[:, None].repeat(1, l)
+
+        mask_indices = torch.rand((b, l), device=self.device) < p_mask
+        noisy_batch = torch.where(mask_indices, self.NOISY_MASK_TOKEN_ID, batch_inp)
+
+        return noisy_batch, p_mask, u0
+
+    def _eval_target_nll_mc(self, inp, cont_toks, inplen):
+        self.model.eval()
+        target_len = len(cont_toks)
+
+        # Use chunking to avoid OOM when num_mc is too large
+        max_batch_size = self._max_chunk_size  # Adjust based on available memory
+        total_loss = 0.0
+        u0 = None
+        
+        # Define mask_positions outside the loop so it can be used in greedy prediction
+        mask_positions = torch.arange(target_len, device=self.device)
+        mask_positions = inplen - len(cont_toks) + mask_positions
+        
+        for chunk_start in range(0, self._num_mc, max_batch_size):
+            chunk_end = min(chunk_start + max_batch_size, self._num_mc)
+            chunk_size = chunk_end - chunk_start
+            
+            # Create batch of inputs by repeating and masking different positions
+            batch_inp = inp.unsqueeze(0).repeat(chunk_size, 1)
+
+            # generate random masks
+            noisy_batch_inp = batch_inp.clone()
+            noisy_batch_inp_, p_mask, u0 = self._forward_process(batch_inp, chunk_start=chunk_start, u0=u0)
+            cont_toks = torch.tensor(cont_toks, dtype=torch.long, device=self.device)
+
+            noisy_batch_inp[:, mask_positions] = noisy_batch_inp_[:, mask_positions]
+            mask_indices = (noisy_batch_inp == self.NOISY_MASK_TOKEN_ID) & (torch.arange(noisy_batch_inp.shape[1], device=self.device) < inplen)
+
+            with torch.no_grad():
+                logits = self._model_call(noisy_batch_inp)
+
+            if logits is not None:
+                chunk_loss = F.cross_entropy(logits[mask_indices], batch_inp[mask_indices], reduction='none') / p_mask[mask_indices]
+                total_loss += chunk_loss.sum().cpu().item()
+        loss = total_loss / self._num_mc
+
+        # greedy prediction
+        if not self.only_mc_nll:
+            pred_inp = inp.unsqueeze(0)
+            pred_inp[: , mask_positions] = self.NOISY_MASK_TOKEN_ID
+            with torch.no_grad():
+                for i in range(len(cont_toks)):
+                    mask_index = (pred_inp == self.NOISY_MASK_TOKEN_ID)
+                    pred_logits = self._model_call(pred_inp)[mask_index]
+                    # select the argmax of the logits
+                    pred_tok = pred_logits.argmax(dim=-1)
+                    
+                    p = torch.softmax(pred_logits.to(torch.float32), dim=-1)
+                    confidence = torch.gather(p, dim=-1, index=torch.unsqueeze(pred_tok, -1)).squeeze(dim=-1)
+                    _, index = torch.sort(confidence, descending=True)
+                    pred_tok[index[1:]] = self.NOISY_MASK_TOKEN_ID
+                    pred_inp[mask_index] = pred_tok.clone()
+                pred_ans = pred_inp[: , mask_positions]
+                max_equal = (pred_ans == cont_toks).all().cpu()
+            answer = (float(-loss), bool(max_equal))
+        else:
+            answer = (float(-loss), None)
+        return answer
+
+
     def create_model_inputs(self, tokens):
         args = get_args()
-
-        attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+        # create attention mask (no need so all ones)
+        attention_mask = torch.ones(1, 1, tokens.shape[1], tokens.shape[1], device=tokens.device)
+        attention_mask = (attention_mask < 0.5)
+        
+        # Get the masks and postition ids.
+        _, loss_mask, position_ids = get_ltor_masks_and_position_ids(
             tokens,
             self.EOT_TOKEN_ID,
             args.reset_position_ids,
             args.reset_attention_mask,
-            args.eod_mask_loss)
-
-        return (tokens, position_ids, attention_mask), (tokens, loss_mask)
+            args.eod_mask_loss,
+            True)
+        
+        masked_indices = tokens == self.NOISY_MASK_TOKEN_ID
+        # Calculate p_mask as ratio of masked tokens to total tokens
+        num_masked = masked_indices.sum()
+        total_tokens = tokens.shape[0] * tokens.shape[1]
+        p_mask = (num_masked / total_tokens).item()
+        p_mask = torch.full_like(masked_indices, p_mask, dtype=torch.float)
+        return (tokens, position_ids, attention_mask), (tokens, loss_mask, masked_indices, p_mask)
 
     def _model_call(self, inps):
         args = get_args()
@@ -216,12 +378,15 @@ class EvalHarnessAdaptor(GPT2LM):
                 # output = self.model.eval_batch(iter(data_iterator), compute_loss = False, reduce_output = None)
                 output = []
                 for tokens in data_iterator:
-                    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+                    attention_mask = torch.ones(1, 1, tokens.shape[1], tokens.shape[1], device=tokens.device)
+                    attention_mask = (attention_mask < 0.5)
+                    _, loss_mask, position_ids = get_ltor_masks_and_position_ids(
                                                                 tokens,
                                                                 self.EOT_TOKEN_ID,
                                                                 args.reset_position_ids,
                                                                 args.reset_attention_mask,
-                                                                args.eod_mask_loss)
+                                                                args.eod_mask_loss,
+                                                                True)
                     a_output, *other_losses = self.model(tokens,
                         position_ids,
                         attention_mask,
@@ -239,14 +404,15 @@ class EvalHarnessAdaptor(GPT2LM):
                     self.model.total_loss = None
             else:
                 self.model.set_batch_fn(self.create_model_inputs)
+
                 # round up to multiple of micro_batch_size
-                new_size = ((len(inps) + args.micro_batch_size-1)  // args.micro_batch_size) * args.micro_batch_size
+                new_size = ((len(inps) + self._batch_size-1)  // self._batch_size) * self._batch_size
                 padded = F.pad(inps, (0, 0, 0, new_size-len(inps)), value = 0)
                 # dummy data iterator for pipelining.
-                data_iterator = list((torch.stack(inp) for inp in utils.chunks(padded, args.micro_batch_size)))
+                data_iterator = list((torch.stack(inp) for inp in utils.chunks(padded, self._batch_size)))
                 self.model.micro_batches = len(data_iterator)
                 output = self.model.eval_batch(iter(data_iterator), compute_loss = False, reduce_output = None)
-
+                
                 if output is not None:
                     output = torch.cat(output, 1).permute(1, 0, 2)
                     output = output[:len(inps)]
@@ -334,7 +500,8 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
     cp_args = ds_checkpoint.get_args()
     # Merge the current args with the checkpoint args.
     skip_keys = ['world_size', 'rank', 'local_rank','device_count', 'micro_batch_size','global_batch_size', 'batch_size', 'tensorboard_dir', 'deepspeed', 'deepspeed_config',
-                     'data_parallel_size', 'pipeline_model_parallel_size', 'tensor_model_parallel_size', 'moe_expert_parallel_size', 'moe_token_dropping', 'load', 'load_tag', 'rampup_batch_size', 'iteration', 'inference', 'random_ltd']
+                     'data_parallel_size', 'pipeline_model_parallel_size', 'tensor_model_parallel_size', 'moe_expert_parallel_size', 'moe_token_dropping', 'load', 'load_tag', 'rampup_batch_size', 'iteration', 'inference', 'random_ltd'
+                     ,'num_mc', 'make_vocab_size_divisible_by', 'padded_vocab_size', 'untie_embeddings_and_output_weights', 'untie_with_additional_mask']
 
     skip_if_specified = ['merge_file', 'vocab_file']
 
@@ -405,6 +572,11 @@ def tasks_args(parser):
                        help='Should the sequence length be adapted to the batch during evaluation, if in fp16 the results will be slightly different due to numerical errors but greatly speed up evaluation.')
     group.add_argument('--num_fewshot', type=int, default = 0, help='Number of few-shot prompts.')
     group.add_argument('--eval_fp32',  default = False, action='store_true', help='Should the evaluation run in fp32')
+    group.add_argument('--eval_method', type=str, choices=['ar', 'mc'], default='ar', help='Evaluation method of diffusion model')
+    group.add_argument('--sampling_eps', type=float, default=0.0, help='Sampling epsilon for diffusion model')
+    group.add_argument('--only_generate', default=False, action='store_true', help='Only evaluate the accuracy, not the nll')
+    group.add_argument('--only_mc_nll', default=False, action='store_true', help='Only evaluate the nll, not the accuracy')
+    group.add_argument('--max_chunk_size', type=int, default=32, help='Maximum chunk size for mc evaluation')
     return parser
 
 from megatron.arguments import parse_args
@@ -428,7 +600,7 @@ def main():
     model.fwd_outputs = []
 
     tokenizer = get_tokenizer()
-    adaptor = EvalHarnessAdaptor(model, tokenizer)
+    adaptor = EvalHarnessDiffAdaptor(model, tokenizer)
     results = evaluator.evaluate(adaptor, task_dict, False, args.num_fewshot, None)
 
     if mpu.is_pipeline_last_stage() and mpu.get_tensor_model_parallel_rank() == 0:

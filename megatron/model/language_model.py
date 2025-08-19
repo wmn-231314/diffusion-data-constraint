@@ -339,13 +339,22 @@ class EmbeddingPipe(Embedding):
 
         input_ids = inputs[0]
         position_ids = inputs[1]
+
+        attn_idx = 2
+        target_attn_idx = 3
+
+        if self._args.use_target_position_embeddings: # additional input for target position ids
+            attn_idx += 1
+            target_attn_idx += 1
+            target_position_ids = inputs[2]
+
         if hasattr(self._args, 'attn_mask'):
             attention_mask = None
         else:
-            attention_mask = inputs[2]
+            attention_mask = inputs[attn_idx]
 
-        if len(inputs) == 4:
-            tokentype_ids = inputs[3]
+        if len(inputs) == target_attn_idx + 1:
+            tokentype_ids = inputs[target_attn_idx]
         else:
             tokentype_ids = None
         
@@ -353,7 +362,10 @@ class EmbeddingPipe(Embedding):
 
         # If cmd args has attn_mask, we don't forward it as an activation.
         if hasattr(self._args, 'attn_mask'):
-            return embeddings
+            if self._args.use_target_position_embeddings:
+                return (embeddings, target_position_ids)
+            else:
+                return embeddings
         else:
             assert False
             return embeddings, attention_mask
@@ -363,7 +375,109 @@ class EmbeddingPipe(Embedding):
     def word_embeddings_weight(self):
         """Easy accessory for the DeepSpeed pipeline engine to tie embeddings across stages."""
         return self.word_embeddings.weight
+    
+class TargetEmbedding(MegatronModule):
+    """Target position embeddings for language model.
 
+    Arguments:
+        hidden_size: hidden size
+        max_sequence_length: maximum size of sequence. This
+                           is used for target position embedding
+        embedding_dropout_prob: dropout probability for embeddings
+        init_method: weight initialization method
+    """
+
+    def __init__(self,
+                 hidden_size,
+                 max_sequence_length,
+                 embedding_dropout_prob,
+                 config):
+        super(TargetEmbedding, self).__init__()
+
+        self.hidden_size = hidden_size
+        self.init_method = config.init_method
+
+        args = get_args()
+
+        # Target Position embedding (serial).
+        self._target_position_embeddings_key = 'target_position_embeddings'
+        if args.sequence_parallel:
+            self.target_position_embeddings = tensor_parallel.layers.SequenceParallelPositionEmbedding(
+                max_sequence_length, self.hidden_size)
+            # Initialize the target position embeddings.
+            self.init_method(self.target_position_embeddings.local_embeddings.weight)
+        else:
+            self.target_position_embeddings = torch.nn.Embedding(
+                max_sequence_length, self.hidden_size)
+            # Initialize the target position embeddings.
+            if args.perform_initialization:
+                if args.zero_stage == 3:
+                    gather_and_init(self.target_position_embeddings.weight, self.init_method)
+                else:
+                    self.init_method(self.target_position_embeddings.weight)
+
+        self.fp32_residual_connection = args.fp32_residual_connection
+        self.sequence_parallel = args.sequence_parallel
+        # Embeddings dropout
+        self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
+
+    def zero_parameters(self):
+        """Zero out all parameters in embedding."""
+        self.target_position_embeddings.weight.data.fill_(0)
+        self.target_position_embeddings.weight.shared = True
+
+    def forward(self, hidden_states, target_position_ids):
+        # Target Position embeddings.
+        target_position_embeddings = self.target_position_embeddings(target_position_ids)
+
+        # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+        embeddings = target_position_embeddings.transpose(0, 1).contiguous()
+        embeddings = embeddings + hidden_states
+
+        # If the input flag for fp32 residual connection is set, convert for float.
+        if self.fp32_residual_connection:
+            embeddings = embeddings.float()
+
+        # Dropout.
+        if self.sequence_parallel:
+            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            with tensor_parallel.get_cuda_rng_tracker().fork():
+                embeddings = self.embedding_dropout(embeddings)
+        else:
+            embeddings = self.embedding_dropout(embeddings)
+
+        return embeddings
+
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
+        """For easy load."""
+        state_dict_ = {}
+        state_dict_[self._target_position_embeddings_key] \
+            = self.target_position_embeddings.state_dict(prefix=prefix,
+                                                     keep_vars=keep_vars)
+        return state_dict_
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Customized load."""
+        # Target Position embedding.
+        if self._target_position_embeddings_key in state_dict:
+            state_dict_ = state_dict[self._target_position_embeddings_key]
+        else:
+            # for backward compatibility.
+            state_dict_ = {}
+            for key in state_dict.keys():
+                if 'target_position_embeddings' in key:
+                    state_dict_[key.split('target_position_embeddings.')[1]] \
+                        = state_dict[key]
+        self.target_position_embeddings.load_state_dict(state_dict_, strict=strict)
+
+
+class TargetEmbeddingPipe(TargetEmbedding):
+    def forward(self, inputs, **kwargs):
+        assert len(inputs) == 2, 'TargetEmbeddingPipe should have 2 inputs'
+        hidden_states = inputs[0]
+        target_position_ids = inputs[1]
+        embeddings = super().forward(hidden_states, target_position_ids)
+        return embeddings
 
 class TransformerLanguageModel(MegatronModule):
     """Transformer language model.
@@ -411,8 +525,13 @@ class TransformerLanguageModel(MegatronModule):
 
         # Embeddings.
         if self.pre_process:
+            # check if untie and additional mask
+            if args.untie_with_additional_mask and args.untie_embeddings_and_output_weights:
+                vocab_size = args.padded_vocab_size + 1
+            else:
+                vocab_size = args.padded_vocab_size
             self.embedding = Embedding(self.hidden_size,
-                                       args.padded_vocab_size,
+                                       vocab_size,
                                        args.max_position_embeddings,
                                        args.hidden_dropout,
                                        config,

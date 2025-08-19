@@ -11,8 +11,8 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from megatron.model import GPTModel, GPTModelPipe
+from megatron.data.emotion_dataset import EmotionDataset
+from megatron.model.diff_gpt_model import DiffGPTModel, DiffGPTModelPipe
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group, update_rotary_pos_emb
@@ -31,11 +31,14 @@ import torch.nn.functional as F
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
-    print_rank_0('building GPT model ...')
+    print_rank_0('building GPT based Masked Diffusion model ...')
     see_memory_usage(f"Before Building Model", force=True)
 
     args = get_args()
     config = core_transformer_config_from_args(args)
+    # config.init_method_std = 0.2
+    # config.init_method = torch.nn.init.xavier_uniform_
+    
     if hasattr(mpu, 'get_sequence_data_parallel_group'):
         dpg = mpu.get_sequence_data_parallel_group()
     elif hasattr(mpu, 'get_data_parallel_group'):
@@ -48,7 +51,7 @@ def model_provider(pre_process=True, post_process=True):
                              enabled=args.zero_stage == 3,
                              mpu=mpu):
         if args.deepspeed and not args.no_pipeline_parallel:
-            model = GPTModelPipe(
+            model = DiffGPTModelPipe(
                 config=config,
                 num_tokentypes=0,
                 parallel_output=True
@@ -60,12 +63,13 @@ def model_provider(pre_process=True, post_process=True):
             # Predompute the attention mask and store it in args. This avoids having to
             # pipeline it as an activation during training. The mask is constant, and thus
             # we can reuse it.
-            attention_mask = torch.tril(torch.ones(
-                (1, args.seq_length, args.seq_length), device=get_accelerator().current_device_name())).view(
-                    1, 1, args.seq_length, args.seq_length)
+
+            # Make attention mask to be all ones for masked diffusion
+            attention_mask = torch.ones((1, 1, args.seq_length, args.seq_length), device=get_accelerator().current_device_name())
 
             # Convert attention mask to binary:
             attention_mask = (attention_mask < 0.5)
+
             if args.fp16:
                 attention_mask = attention_mask.half()
             elif args.bf16:
@@ -79,7 +83,7 @@ def model_provider(pre_process=True, post_process=True):
                 update_rotary_pos_emb(args.seq_length)
 
         else:
-            model = GPTModel(
+            model = DiffGPTModel(
                 config=config,
                 num_tokentypes=0,
                 parallel_output=True,
@@ -95,78 +99,94 @@ def get_batch(data_iterator, eps=1e-3):
     args = get_args()
     tokenizer = get_tokenizer()
 
-    # Items and their type.
-    keys = ['text']
-    datatype = torch.int64
+    # check if untie and additional mask
+    if args.untie_embeddings_and_output_weights and args.untie_with_additional_mask:
+        mask_token_id = args.padded_vocab_size
+    else:
+        mask_token_id = tokenizer.vocab_size
 
     # Broadcast data.
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
+
+    # Items and their type.
+    keys = ['text', 'input_ids_lens']
+    datatype = torch.int64
+
+    # Broadcast data.
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
     # Unpack.
     tokens_ = data_b['text'].long()
-    micro_batch_size = tokens_.size(0)
-    seq_length = args.seq_length
+    input_ids_lens = data_b['input_ids_lens'].long()
+    max_len = max(input_ids_lens)
+    tokens = tokens_[:, :max_len].contiguous()
+    labels = tokens # diffusion model use token itself as label
 
-    labels = tokens_[:, 1:].contiguous()
-    tokens = tokens_[:, :-1].contiguous()
+    micro_batch_size, seq_length = tokens.size()
+    t = torch.rand(micro_batch_size, device=tokens.device)
+    
+    p_mask = (1 - eps) * t + eps
+    p_mask = p_mask[:, None].repeat(1, seq_length)
+
+    masked_indices = torch.rand((micro_batch_size, seq_length), device=tokens.device) < p_mask
+
+    if args.ar_ratio > 0:
+        ar_mask = torch.rand((micro_batch_size,), device=tokens.device) <= args.ar_ratio
+        for i in range(micro_batch_size):
+            if ar_mask[i]:
+                # get num of masked tokens
+                num_masked = torch.sum(masked_indices[i, :])
+
+                masked_indices[i, :] = False
+
+                # get random indices to mask
+                masked_indices[i, -num_masked:] = True
+
+    noisy_input = torch.where(masked_indices, mask_token_id, tokens)
+    labels = tokens
+
+    # create attention mask (no need so all ones)
+    attention_mask = torch.ones(1, 1, seq_length, seq_length, device=tokens.device)
+    attention_mask = (attention_mask < 0.5)
 
     # Get the masks and postition ids.
-    skip_mask = args.use_flash_attn or args.use_flash_attn_triton
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+    _, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens,
         tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
         args.eod_mask_loss,
-        skip_mask)
-    
-    if args.randmask_ratio > 0:
-        # extand attention mask to 3D
-        attention_mask = attention_mask.repeat(micro_batch_size, 1, 1, 1)
-        for i in range(micro_batch_size):
-            rand_toks = torch.rand(seq_length, device=tokens.device) < args.randmask_ratio
-            # additional_mask = rand_toks.unsqueeze(0).expand(seq_length, seq_length)
-            # attention_mask[i, :, :, :] = attention_mask[i, :, :, :] | additional_mask
-            t = torch.rand(seq_length, device=tokens.device)
-            p_mask = (1 - eps) * t + eps
-            p_mask = p_mask.repeat(seq_length, 1).permute(1, 0)
-            additional_attn_mask = (torch.rand((seq_length, seq_length), device=tokens.device) < p_mask) & rand_toks.unsqueeze(1)
-            attention_mask[i, :, :, :] = additional_attn_mask | attention_mask[i, :, :, :]
-            # remove diagonal, make sure the token can attend to itself
-            attention_mask[i, :, :, :] = attention_mask[i, :, :, :] & ~torch.eye(seq_length, device=tokens.device).bool()
-        args.attn_mask = attention_mask
-    else:
-        args.attn_mask = attention_mask
+        True)
 
     # For DS's sequence parallel
     seq_parallel_world_size = mpu.get_sequence_parallel_world_size()
     seq_parallel_world_rank = mpu.get_sequence_parallel_rank()
 
     if args.ds_sequence_parallel_fpdt:
-        return FPDT_InputConstruct(tokens, labels, loss_mask, attention_mask, position_ids, args, seq_parallel_world_size, seq_parallel_world_rank).generate()
+        return FPDT_InputConstruct(noisy_input, labels, loss_mask, attention_mask, position_ids, args, seq_parallel_world_size, seq_parallel_world_rank).generate()
 
     # For Megatron's sequence parallel
     if args.sequence_parallel:
         seq_parallel_world_size = mpu.get_tensor_model_parallel_world_size()
         seq_parallel_world_rank = mpu.get_tensor_model_parallel_rank()
-    seq_length = tokens.size(1)
+    seq_length = noisy_input.size(1)
 
     assert seq_length % seq_parallel_world_size == 0
     sub_seq_length = seq_length // seq_parallel_world_size
     sub_seq_start = seq_parallel_world_rank * sub_seq_length
     sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
 
-    tokens = tokens[:, sub_seq_start:sub_seq_end]
+    noisy_input = noisy_input[:, sub_seq_start:sub_seq_end]
     position_ids = position_ids[:, sub_seq_start:sub_seq_end]
     # For DS's sequence parallel
     if mpu.get_sequence_parallel_world_size() > 1:
         labels = labels[:, sub_seq_start:sub_seq_end]
 
-    return tokens, labels, loss_mask, attention_mask, position_ids
+    return noisy_input, labels, loss_mask, attention_mask, position_ids, masked_indices, p_mask
+
 
 def data_post_process(data, data_sampler_state_dict):
     args = get_args()
@@ -198,8 +218,14 @@ def get_batch_pipe(data, eps=1e-3):
     args = get_args()
     tokenizer = get_tokenizer()
 
+    # check if untie and additional mask
+    if args.untie_embeddings_and_output_weights and args.untie_with_additional_mask:
+        mask_token_id = args.padded_vocab_size
+    else:
+        mask_token_id = tokenizer.vocab_size
+
     # Items and their type.
-    keys = ['text']
+    keys = ['text', 'input_ids_lens']
     datatype = torch.int64
 
     # Broadcast data.
@@ -207,59 +233,70 @@ def get_batch_pipe(data, eps=1e-3):
 
     # Unpack.
     tokens_ = data_b['text'].long()
-    micro_batch_size = tokens_.size(0)
-    seq_length = args.seq_length
+    input_ids_lens = data_b['input_ids_lens'].long()
+    max_len = max(input_ids_lens)
+    tokens = tokens_[:, :max_len].contiguous()
+    labels = tokens
 
-    labels = tokens_[:, 1:].contiguous()
-    tokens = tokens_[:, :-1].contiguous()
+    micro_batch_size, seq_length = tokens.size()
+    t = torch.rand(micro_batch_size, device=tokens.device)
 
+    # when early iteration, use a smaller mask ratio
+    if args.low_noise_start and args.iteration < args.low_noise_iter:
+        t = t * args.low_noise_ratio # new range [0, args.low_noise_ratio]
+
+    p_mask = (1 - eps) * t + eps
+    p_mask = p_mask[:, None].repeat(1, seq_length)
+
+    masked_indices = torch.rand((micro_batch_size, seq_length), device=tokens.device) < p_mask
+
+    if args.ar_ratio > 0:
+        ar_mask = torch.rand((micro_batch_size,), device=tokens.device) <= args.ar_ratio
+        for i in range(micro_batch_size):
+            if ar_mask[i]:
+                # get num of masked tokens
+                num_masked = torch.sum(masked_indices[i, :])
+
+                masked_indices[i, :] = False
+                
+                # get random indices to mask
+                masked_indices[i, -num_masked:] = True
+
+    noisy_input = torch.where(masked_indices, mask_token_id, tokens)
+    
+    # create attention mask (no need so all ones)
+    attention_mask = torch.ones(1, 1, seq_length, seq_length, device=tokens.device)
+    attention_mask = (attention_mask < 0.5)
+
+    args.attn_mask = attention_mask.to(torch.bool)
+    
     # Get the masks and postition ids.
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+    _, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens,
         tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
-        args.eod_mask_loss)
-        
-    # update rotary pos emb
-    if args.use_rotary_position_embeddings:
-        update_rotary_pos_emb(position_ids)
-
-    if args.randmask_ratio > 0:
-        # extand attention mask to 3D
-        attention_mask = attention_mask.repeat(micro_batch_size, 1, 1, 1)
-        for i in range(micro_batch_size):
-            rand_toks = torch.rand(seq_length, device=tokens.device) < args.randmask_ratio
-            # additional_mask = rand_toks.unsqueeze(0).expand(seq_length, seq_length)
-            # attention_mask[i, :, :, :] = attention_mask[i, :, :, :] | additional_mask
-            t = torch.rand(seq_length, device=tokens.device)
-            p_mask = (1 - eps) * t + eps
-            p_mask = p_mask.repeat(seq_length, 1).permute(1, 0)
-            additional_attn_mask = (torch.rand((seq_length, seq_length), device=tokens.device) < p_mask) & rand_toks.unsqueeze(1)
-            attention_mask[i, :, :, :] = additional_attn_mask | attention_mask[i, :, :, :]
-            # remove diagonal, make sure the token can attend to itself
-            attention_mask[i, :, :, :] = attention_mask[i, :, :, :] & ~torch.eye(seq_length, device=tokens.device).bool()
-        args.attn_mask = attention_mask
-    else:
-        args.attn_mask = attention_mask
-
-    if args.curriculum_learning_legacy and args.curriculum_seqlen < tokens.size()[1]:
+        args.eod_mask_loss,
+        True)
+    
+    if args.curriculum_learning_legacy and args.curriculum_seqlen < seq_length:
         # seqlen-based curriculum learning
         # tokens, position_ids, labels, loss_mask have size [batch size, seqlen]
-        tokens = tokens[:, :args.curriculum_seqlen].contiguous()
+        noisy_input = noisy_input[:, :args.curriculum_seqlen].contiguous()
         position_ids = position_ids[:, :args.curriculum_seqlen].contiguous()
         if labels is not None:
             labels = labels[:, :args.curriculum_seqlen].contiguous()
         loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
 
-    return (tokens, position_ids, attention_mask), (labels, loss_mask)
+    return (noisy_input, position_ids, attention_mask), (labels, loss_mask, masked_indices, p_mask)
 
 
-def loss_func(loss_mask, moe_loss, mos_loss, output_tensor):
+def loss_func(loss_mask, moe_loss, mos_loss, masked_indices, p_mask, output_tensor):
     args = get_args()
-    losses = output_tensor.float()
-    loss_mask = loss_mask.view(-1).float()
-    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    losses = output_tensor[masked_indices].float() / p_mask[masked_indices].float()
+    # loss_mask = loss_mask.view(-1).float()
+    # loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    loss = losses.sum() / (output_tensor.shape[0] * output_tensor.shape[1])
 
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
@@ -311,9 +348,10 @@ def forward_step(data_iterator, model):
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+    tokens, labels, loss_mask, attention_mask, position_ids, masked_indices, p_mask = get_batch(
         data_iterator)
     timers('batch-generator').stop()
+
     if args.data_efficiency_curriculum_learning:
         args.curriculum_seqlen = tokens.size()[1]
         if hasattr(args, 'data_efficiency_curriculum_learning_seqlen_type') and \
@@ -347,29 +385,22 @@ def forward_step(data_iterator, model):
                 args.teacher_model[0], tokens, position_ids, attention_mask)
 
     # Output_tensor stores the standard loss, loos_func calculates the total loss.
-    return output_tensor, partial(loss_func, loss_mask, moe_loss, mos_loss)
-
+    return output_tensor, partial(loss_func, loss_mask, moe_loss, mos_loss, masked_indices, p_mask)
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
 
-    print_rank_0('> building train, validation, and test datasets '
+    print_rank_0('> building finetune datasets '
                  'for GPT ...')
-    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-        data_prefix=args.data_path,
-        data_impl=args.data_impl,
-        splits_string=args.split,
-        train_valid_test_num_samples=train_val_test_num_samples,
-        seq_length=args.seq_length,
-        seed=args.seed,
-        skip_warmup=(not args.mmap_warmup),
-        train_data_prefix=args.train_data_path,
-        valid_data_prefix=args.valid_data_path,
-        test_data_prefix=args.test_data_path,
-        data_cache_path=args.data_cache_path)
-    print_rank_0("> finished creating GPT datasets ...")
-    return train_ds, valid_ds, test_ds
+    
+    tokenizer = get_tokenizer()
+
+   # The finetune dataset is not large and defaults to using one file
+    train_ds = EmotionDataset(args.data_path[0],tokenizer)
+
+    print_rank_0("> finished creating finetune datasets ...")
+    return train_ds, None, None
 
 
 def command_exists(cmd):

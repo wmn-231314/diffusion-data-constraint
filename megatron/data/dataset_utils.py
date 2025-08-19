@@ -65,16 +65,22 @@ def get_datasets_weights_and_num_samples(data_prefix,
     # samples left to feed to the network.
     if isinstance(train_valid_test_num_samples, list):
         datasets_train_valid_test_num_samples = []
-        for weight in weights:
-            datasets_train_valid_test_num_samples.append(
-                [int(math.ceil(val * weight * 1.005))
-                for val in train_valid_test_num_samples])
+        if len(weights) == 1: # only one dataset
+            datasets_train_valid_test_num_samples = train_valid_test_num_samples
+        else:
+            for weight in weights:
+                datasets_train_valid_test_num_samples.append(
+                    [int(math.ceil(val * weight * 1.005))
+                    for val in train_valid_test_num_samples])
     else:
         # Used when separate dataset files are provided for train,
         # valid and test
-        datasets_train_valid_test_num_samples = [
-            int(math.ceil(train_valid_test_num_samples * weight * 1.005))
-            for weight in weights]
+        if len(weights) == 1: # only one dataset
+            datasets_train_valid_test_num_samples = [train_valid_test_num_samples]
+        else:
+            datasets_train_valid_test_num_samples = [
+                int(math.ceil(train_valid_test_num_samples * weight * 1.005))
+                for weight in weights]
 
     return prefixes, weights, datasets_train_valid_test_num_samples
 
@@ -639,6 +645,21 @@ def get_train_valid_test_split_(splits_string, size):
         splits_index[index] -= diff
     assert len(splits_index) == 4
     assert splits_index[-1] == size
+    return splits_index
+
+def get_split_by_range_(range_string, size):
+    """ Get dataset splits based on a range:
+    range_string is in the form  START%:END%  for e.g. 0.2:0.8
+    outputs an array of two values [start_index, end_index]
+    """
+    # some checks that range is given in the correct form
+    splits = [float(i) for i in range_string.split(":")]
+    assert len(splits) == 2, "splits should be passed as start:end"
+    assert splits[0] <= 1 and splits[1] <= 1
+    splits_sum = sum(splits)
+    assert splits_sum > 0.0
+    splits_index = [round(s * float(size)) for s in splits]
+    assert len(splits_index) == 2
     return splits_index
 
 def get_samples_mapping(indexed_dataset,

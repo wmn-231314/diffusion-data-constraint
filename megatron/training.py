@@ -47,7 +47,7 @@ from megatron.utils import unwrap_model, found_kill_switch
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator, update_rotary_pos_emb
+from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator, update_rotary_pos_emb, get_parameters_in_billions
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.arguments import core_transformer_config_from_args
 from megatron.profiler import setup_profiler, trigger, on_step_begin, on_step_end
@@ -195,6 +195,7 @@ def pretrain(train_valid_test_dataset_provider,
         train_data_iterator, valid_data_iterator, test_data_iterator \
             = build_train_valid_test_data_iterators(
                 train_valid_test_dataset_provider)
+
     if args.data_efficiency_curriculum_learning:
         if args.deepspeed_dataloader is not None:
             # We use args to pass the deepspeed_dataloader because adding
@@ -236,7 +237,6 @@ def pretrain(train_valid_test_dataset_provider,
                             model, optimizer, opt_param_scheduler,
                             train_data_iterator, valid_data_iterator,
                             process_non_loss_data_func)
-
         print_datetime('after training is done')
         # Clean the model
         if args.compression_training:
@@ -255,14 +255,14 @@ def pretrain(train_valid_test_dataset_provider,
         evaluate_and_print_results(prefix, forward_step_func,
                                    valid_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
-                                   verbose=True, write_to_tensorboard=not args.skip_train)
+                                   verbose=True) # always write to tensorboard
 
     if args.do_test:
         prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from test set'
         evaluate_and_print_results(prefix, forward_step_func,
                                    test_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
-                                   verbose=True, write_to_tensorboard=not args.skip_train, test=True)
+                                   verbose=True, test=True) # always write to tensorboard
     return model
 
 
@@ -543,6 +543,7 @@ def setup_model_and_optimizer(model_provider_func,
                 config=args.deepspeed_config_dict,
             )
         model = [model]
+
         if args.load is not None:
             args.iteration = load_checkpoint(model, None, None, strict=False)
         else:
@@ -594,8 +595,11 @@ def setup_model_and_optimizer(model_provider_func,
                 # We only need to build the training data here. And we follow
                 # baseline's logic to build eval/test dataset later in
                 # build_train_valid_test_data_iterators.
-                eval_iters = (args.train_iters // args.eval_interval + 1) * \
-                            args.eval_iters
+                if args.skip_train:
+                    eval_iters = args.eval_iters
+                else:
+                    eval_iters = (args.train_iters // args.eval_interval + 1) * \
+                                args.eval_iters
                 test_iters = args.eval_iters
                 train_val_test_num_samples = [train_samples,
                                             eval_iters * args.global_batch_size,
@@ -675,6 +679,9 @@ def train_step(forward_step_func, data_iterator,
         num_zeros_in_grad = 0
         assert isinstance(model[0], deepspeed.PipelineEngine)
         loss = model[0].train_batch(data_iter=data_iterator)
+        # for name, param in model[0].named_parameters():
+        #     if 'attention' in name and param.grad is not None:
+        #         print(f"[Grad] {name}: mean={param.grad.abs().mean().item():.6e}, std={param.grad.std().item():.6e}")
         additional_losses = model[0].get_additional_losses()
         loss_key = 'lm loss' if additional_losses is None else 'loss'  # use "lm loss" for backward compatibility
         loss_dict = OrderedDict({loss_key: loss})
@@ -868,6 +875,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     advanced_iters_key = 'advanced iterations'
     skipped_iters_key = 'skipped iterations'
     nan_iters_key = 'nan iterations'
+
+    # Gigaflos no embeddings.
+    x_axis_gigaflops_no_embeds = 'gigaflops (no embeddings)'
+
     # Advanced iterations.
     if not skipped_iter:
         total_loss_dict[advanced_iters_key] = total_loss_dict.get(
@@ -957,6 +968,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                               args.consumed_train_samples, x_axis_samples)
             writer.add_scalar(f"lm-loss-training/{key}" + ' vs tokens', loss_dict[key],
                               args.consumed_train_tokens, x_axis_tokens)
+
+            writer.add_scalar(f"lm-loss-training/{key}" + ' vs gigaflos (no embeddings)', loss_dict[key],
+                              int(args.gigaflops_no_embeds), x_axis_gigaflops_no_embeds)
+            
         if args.fp16 and loss_scale and args.log_loss_scale_to_tensorboard:
             writer.add_scalar('loss-scale/loss-scale', loss_scale, iteration)
             writer.add_scalar('loss-scale/loss-scale vs samples', loss_scale,
@@ -1241,6 +1256,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
+
+    # Compute number of parameters in model.
+    num_params = get_parameters_in_billions(model)
+    num_params_no_embeds = get_parameters_in_billions(model, exclude_embeddings=True)
+    print_rank_0(f'Params || All: {num_params}B | No Embeds: {num_params_no_embeds}B')
+
     report_memory_flag = True
     if args.random_ltd:
         assert model[0].random_ltd_enabled()
@@ -1278,6 +1299,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                        args.micro_batch_size * \
                                        get_num_microbatches()
         args.consumed_train_samples += new_samples
+        args.gigaflops_no_embeds += (6 * new_samples * args.seq_length * get_parameters_in_billions(model, exclude_embeddings=True))
         # This actual_seq_length is used for actual consumed tokens calculation, flops calculation, and logging.
         args.actual_seq_length = args.seq_length
         if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
@@ -1416,11 +1438,14 @@ def evaluate(forward_step_func,
 
     with torch.no_grad():
         iteration = 0
-        while iteration < args.eval_iters:
+        total_eval_iters = args.eval_iters * args.num_mc
+        if args.num_mc > 1:
+            print_rank_0(f"Evaluating with {args.num_mc} Monte Carlo samples")
+        while iteration < total_eval_iters:
             iteration += 1
             if verbose and iteration % args.log_interval == 0:
                 print_rank_0('Evaluating iter {}/{}'.format(iteration,
-                                                            args.eval_iters))
+                                                            total_eval_iters))
 
             forward_backward_func = get_forward_backward_func()
             # Don't care about timing during evaluation
@@ -1475,7 +1500,7 @@ def evaluate(forward_step_func,
         model_module.train()
 
     for key in total_loss_dict:
-        total_loss_dict[key] /= args.eval_iters * get_num_microbatches()
+        total_loss_dict[key] /= total_eval_iters * get_num_microbatches()
 
     if args.curriculum_learning_legacy and not args.no_pipeline_parallel:
         # roll back to actual curriculum seqlen at the end of eval.
@@ -1494,12 +1519,21 @@ def evaluate_and_print_results(prefix, forward_step_func,
                                verbose=False, write_to_tensorboard=True, test=False):
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
+    # set randmask to 0
+    old_randmask_ratio = args.randmask_ratio
+    old_ar_ratio = args.ar_ratio
+    args.randmask_ratio = 0.0
+    args.ar_ratio = 0.0
+    print_rank_0(f"Setting randmask_ratio to 0 for evaluation")
+    print_rank_0(f"Setting ar_ratio to 0 for evaluation")
+
     if write_to_tensorboard:
         writer = interop_tool_logger(tb_writer=get_tensorboard_writer(), wandb_writer=get_wandb_writer())
     else:
         writer = interop_tool_logger()
     x_axis_samples = 'Samples'
     x_axis_tokens = 'Tokens'
+    x_axis_gigaflops_no_embeds = 'gigaflos (no embeddings)'
 
     total_loss_dict, collected_non_loss_data = evaluate(
         forward_step_func, data_iterator, model,
@@ -1522,6 +1556,11 @@ def evaluate_and_print_results(prefix, forward_step_func,
                               total_loss_dict[key].item(),
                               args.consumed_train_tokens,
                               x_axis_tokens)
+            writer.add_scalar(f'lm-loss-validation/{key} {data_type} vs gigaflos (no embeddings)',
+                              total_loss_dict[key].item(),
+                              int(args.gigaflops_no_embeds), 
+                              x_axis_gigaflops_no_embeds)
+            
             if args.log_validation_ppl_to_tensorboard:
                 writer.add_scalar(f'lm-loss-validation/{key} {data_type} ppl', ppl,
                                   iteration)
@@ -1529,6 +1568,8 @@ def evaluate_and_print_results(prefix, forward_step_func,
                                   ppl, args.consumed_train_samples, x_axis_samples)
                 writer.add_scalar(f'lm-loss-validation/{key} {data_type} ppl vs tokens',
                                   ppl, args.consumed_train_tokens, x_axis_tokens)
+                writer.add_scalar(f'lm-loss-validation/{key} {data_type} ppl vs gigaflos (no embeddings)',
+                                  ppl, int(args.gigaflops_no_embeds), x_axis_gigaflops_no_embeds)
 
     if process_non_loss_data_func is not None and writer.is_enabled() and is_last_rank():
         process_non_loss_data_func(collected_non_loss_data, iteration, writer)
@@ -1537,6 +1578,12 @@ def evaluate_and_print_results(prefix, forward_step_func,
     print_rank_last('-' * length)
     print_rank_last(string)
     print_rank_last('-' * length)
+
+    # reset randmask_ratio
+    args.randmask_ratio = old_randmask_ratio
+    args.ar_ratio = old_ar_ratio
+    print_rank_0(f"Resetting randmask_ratio to {old_randmask_ratio} for evaluation")
+    print_rank_0(f"Resetting ar_ratio to {old_ar_ratio} for evaluation")
 
 
 def cyclic_iter(iter):
@@ -1555,7 +1602,10 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
         train_samples = args.train_samples
     else:
         train_samples = args.train_iters * args.global_batch_size
-    eval_iters = (args.train_iters // args.eval_interval + 1) * \
+    if args.skip_train:
+        eval_iters = args.eval_iters
+    else:
+        eval_iters = (args.train_iters // args.eval_interval + 1) * \
                  args.eval_iters
     test_iters = args.eval_iters
     train_val_test_num_samples = [train_samples,
@@ -1601,14 +1651,19 @@ def build_train_valid_test_data_loaders(
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(
             train_ds, args.consumed_train_samples)
-        valid_dataloader = build_pretraining_data_loader(
-            valid_ds, args.consumed_valid_samples)
+        if args.skip_train:
+            valid_dataloader = build_pretraining_data_loader(
+                valid_ds, 0)
+        else:
+            valid_dataloader = build_pretraining_data_loader(
+                valid_ds, args.consumed_valid_samples)
         test_dataloader = build_pretraining_data_loader(test_ds, 0)
 
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0
         do_valid = valid_dataloader is not None and args.eval_iters > 0
         do_test = test_dataloader is not None and args.eval_iters > 0
+
         # Need to broadcast num_tokens and num_type_tokens.
         flags = get_accelerator().LongTensor(
             [int(do_train), int(do_valid), int(do_test)])

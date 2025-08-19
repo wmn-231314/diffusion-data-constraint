@@ -1,7 +1,7 @@
 # Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-"""GPT-2 model."""
+"""GPT-2 model with target position embedding support."""
 
 import torch
 from collections import OrderedDict
@@ -17,7 +17,7 @@ from .utils import init_method_normal
 from .utils import scaled_init_method_normal
 
 from megatron.model import LayerNorm, RMSNorm
-from .language_model import EmbeddingPipe
+from .language_model import EmbeddingPipe, TargetEmbeddingPipe
 from .transformer import ParallelTransformerLayerPipe, LMHeadPipe, get_num_experts_per_layer
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 from deepspeed.sequence.fpdt_layer import FPDT_LogitsLoss
@@ -185,8 +185,8 @@ class UniversalCheckpointInfo:
         return patterns
 
 
-class GPTModel(MegatronModule):
-    """GPT-2 Language model."""
+class TargetGPTModel(MegatronModule):
+    """GPT-2 Language model with target position embedding support."""
 
     def __init__(self,
                  config,
@@ -205,11 +205,15 @@ class GPTModel(MegatronModule):
         self.return_moe_loss = return_moe_loss
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
 
+        # Add target position embedding
+        self.target_position_embeddings = torch.nn.Embedding(args.max_position_embeddings, args.hidden_size)
+        self._init_target_position_embeddings()
+
         self.language_model, self._language_model_key = get_language_model(
             config=config,
             num_tokentypes=num_tokentypes,
             add_pooler=False,
-            encoder_attn_mask_type=AttnMaskType.padding if args.randmask_ratio > 0 else AttnMaskType.causal,
+            encoder_attn_mask_type=AttnMaskType.causal,
             pre_process=self.pre_process,
             post_process=self.post_process,
             num_experts=args.num_experts)
@@ -217,11 +221,13 @@ class GPTModel(MegatronModule):
         if not args.untie_embeddings_and_output_weights:
             self.initialize_word_embeddings()
 
-    def set_input_tensor(self, input_tensor):
-        """See megatron.model.transformer.set_input_tensor()"""
-        self.language_model.set_input_tensor(input_tensor)
+    def _init_target_position_embeddings(self):
+        """Initialize target position embeddings with normal distribution."""
+        args = get_args()
+        init_method_normal(args.init_method_std)(self.target_position_embeddings.weight)
 
     def forward(self, input_ids, position_ids, attention_mask,
+                target_position_ids=None,
                 retriever_input_ids=None,
                 retriever_position_ids=None,
                 retriever_attn_mask=None,
@@ -231,28 +237,35 @@ class GPTModel(MegatronModule):
         if curriculum_seqlen is not None:
             args.curriculum_seqlen = curriculum_seqlen
             if curriculum_seqlen < input_ids.size()[1]:
-                # seqlen-based curriculum learning
-                # input_ids, position_ids, labels have size [batch size, seqlen]
                 input_ids = input_ids[:, :curriculum_seqlen].contiguous()
                 position_ids = position_ids[:, :curriculum_seqlen].contiguous()
+                if target_position_ids is not None:
+                    target_position_ids = target_position_ids[:, :curriculum_seqlen].contiguous()
                 if labels is not None:
                     labels = labels[:, :curriculum_seqlen].contiguous()
-
-                # attention_mask has size [1, 1, seqlen, seqlen]
                 attention_mask = attention_mask[:, :, :curriculum_seqlen, :curriculum_seqlen].contiguous()
         else:
             if args.curriculum_learning_legacy:
-                # If got a None input, need to reset curriculum_seqlen on user side
                 args.curriculum_seqlen = args.seq_length
 
+        # Get input embeddings from language model
+        input_embeds = self.language_model.embedding.word_embeddings(input_ids)
+        
+        # Add target position embeddings if provided
+        if target_position_ids is not None:
+            target_position_embeddings = self.target_position_embeddings(target_position_ids)
+            input_embeds = input_embeds + target_position_embeddings
+
+        # Forward through language model with modified input embeddings
         lm_output, moe_losses = self.language_model(
-            input_ids,
+            None,  # input_ids is None since we're passing embeddings directly
             position_ids,
             attention_mask,
             retriever_input_ids=retriever_input_ids,
             retriever_position_ids=retriever_position_ids,
             retriever_attn_mask=retriever_attn_mask,
-            inference_params=inference_params)
+            inference_params=inference_params,
+            input_embeds=input_embeds)  # Pass the combined embeddings
 
         if self.post_process:
             lm_output = post_language_model_processing(
@@ -264,8 +277,12 @@ class GPTModel(MegatronModule):
         return lm_output, moe_losses if self.return_moe_loss else lm_output
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-
         state_dict_ = {}
+        
+        # Save target position embeddings
+        state_dict_['target_position_embeddings'] = self.target_position_embeddings.state_dict(
+            prefix=prefix, keep_vars=keep_vars)
+            
         language_model_state_dict = self.language_model.state_dict_for_save_checkpoint(
                 prefix=prefix, keep_vars=keep_vars)
         # MoE states need to be handled separately by DeepSpeed engine, thus
@@ -284,7 +301,12 @@ class GPTModel(MegatronModule):
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
-
+        
+        # Load target position embeddings if present
+        if 'target_position_embeddings' in state_dict:
+            self.target_position_embeddings.load_state_dict(
+                state_dict.pop('target_position_embeddings'), strict=strict)
+                
         # Load word_embeddings.
         if self.post_process and not self.pre_process and not self.untie_embeddings_and_output_weights:
             self.word_embeddings.load_state_dict(
@@ -319,8 +341,8 @@ def CrossEntropy(output, labels):
     return loss
 
 
-class GPTModelPipe(PipelineModule,MegatronModule):
-    """GPT-2 Language model."""
+class TargetGPTModelPipe(PipelineModule,MegatronModule):
+    """GPT-2 Language model with target position embedding support."""
 
     def __init__(self,
                  config,
@@ -369,6 +391,12 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                                             num_tokentypes=num_tokentypes,
                                             embedding_weights_in_fp32=args.embedding_weights_in_fp32,
                                             tied_weight_attr='word_embeddings_weight'))
+            
+        self.specs.append(LayerSpec(TargetEmbeddingPipe,
+                                    args.hidden_size,
+                                    args.max_position_embeddings,
+                                    args.hidden_dropout,
+                                    config))
 
         experts_per_layer = get_num_experts_per_layer(args.num_experts, args.num_layers, args.expert_interval)
         self.is_moe_model = any(n_experts > 1 for n_experts in experts_per_layer)

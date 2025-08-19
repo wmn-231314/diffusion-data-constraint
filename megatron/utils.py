@@ -7,6 +7,7 @@ import sys
 import os
 
 import torch
+import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as torchDDP
 
 from deepspeed.accelerator import get_accelerator
@@ -20,12 +21,12 @@ from megatron import (
     get_num_microbatches
 )
 from megatron.core import mpu
-from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate, VocabParallelEmbedding
 from megatron.model.module import param_is_not_shared
 from megatron.model.rotary_pos_embedding import RotaryEmbedding
 
 
-def update_rotary_pos_emb(seq_length):
+def update_rotary_pos_emb(position_ids):
     args = get_args()
     rotary_dim = args.hidden_size // args.num_attention_heads \
         if args.kv_channels is None else args.kv_channels
@@ -36,8 +37,8 @@ def update_rotary_pos_emb(seq_length):
     # partial rotary embeddings, which is better than full rotary
     # Wang and Komatsuzaki et al
     # https://github.com/kingoflolz/mesh-transformer-jax/
-    rotary_pos_emb = RotaryEmbedding(rotary_dim, theta=args.rope_theta)(seq_length).to(
-        get_accelerator().current_device_name())
+    rotary_pos_emb = RotaryEmbedding(rotary_dim, theta=args.rope_theta)(position_ids).to(get_accelerator().current_device_name())
+    # rotary_pos_emb = tuple(x.to(get_accelerator().current_device_name()) for x in rotary_pos_emb)
     args.rotary_pos_emb = rotary_pos_emb
 
 
@@ -259,13 +260,32 @@ def is_rank_0():
     else:
         return True
 
-def get_parameters_in_billions(model):
+
+def get_parameters_in_billions(model, exclude_embeddings=False, in_bytes=False):
     gpus_per_model = torch.distributed.get_world_size(group=mpu.get_model_parallel_group())
 
-    approx_parameters_in_billions = sum([sum([p.ds_numel if hasattr(p,'ds_id') else  p.nelement() for p in model_module.parameters()])
-                                        for model_module in model])
+    def should_exclude(p, model_module):
+        if not exclude_embeddings:
+            return False
+        for module in model_module.modules():
+            for name, param in module.named_parameters(recurse=False):
+                if param is p:
+                    if isinstance(module, (nn.Embedding, VocabParallelEmbedding)):
+                        return True
+        return False
 
-    return approx_parameters_in_billions*gpus_per_model/(1e9)
+    approx_parameters_in_billions = sum([
+        sum([
+            (p.ds_numel if hasattr(p, 'ds_id') else p.nelement())
+            for p in model_module.parameters()
+            if not should_exclude(p, model_module)
+        ])
+        for model_module in model
+    ])
+    if in_bytes:
+        return approx_parameters_in_billions * gpus_per_model
+    else:
+        return approx_parameters_in_billions * gpus_per_model / 1e9
 
 def throughput_calculator(model, args, iteration_time, total_iterations):
     batch_size = args.micro_batch_size * get_num_microbatches() * args.data_parallel_size

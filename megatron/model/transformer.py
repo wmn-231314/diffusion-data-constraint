@@ -296,7 +296,7 @@ class CoreAttention(MegatronModule):
                        query_layer.size(2),
                        query_layer.size(0),
                        key_layer.size(0))
-
+    
         # [sq, b, np, hn] -> [sq, b * np, hn]
         query_layer = query_layer.view(output_size[2],
                                        output_size[0] * output_size[1], -1)
@@ -728,15 +728,16 @@ class ParallelAttention(MegatronModule):
             if self.enable_ds_sequence_parallel:
                 assert self.projection_size == self.kv_projection_size
                 seq_len, bs = mixed_x_layer.shape[0], mixed_x_layer.shape[1]
-                query_layer = mixed_x_layer[:, :, :self.projection_size].reshape(seq_len, bs, -1, self.head_dim)
-                key_layer = mixed_x_layer[:, :, self.projection_size:self.projection_size+self.kv_projection_size].reshape(seq_len, bs, -1, self.head_dim)
-                value_layer = mixed_x_layer[:, :, self.projection_size+self.kv_projection_size:].reshape(seq_len, bs, -1, self.head_dim)
+                query_layer = mixed_x_layer[:, :, :self.projection_size].contiguous().reshape(seq_len, bs, -1, self.head_dim)
+                key_layer = mixed_x_layer[:, :, self.projection_size:self.projection_size+self.kv_projection_size].contiguous().reshape(seq_len, bs, -1, self.head_dim)
+                value_layer = mixed_x_layer[:, :, self.projection_size+self.kv_projection_size:].contiguous().reshape(seq_len, bs, -1, self.head_dim)
+            
             if self.sequence_parallel or not self.enable_ds_sequence_parallel:
                 seq_len, bs = mixed_x_layer.shape[0], mixed_x_layer.shape[1]
                 each_hidden_size = mixed_x_layer.shape[-1] // 3
-                query_layer = mixed_x_layer[:, :, :each_hidden_size].reshape(seq_len, bs, -1, self.head_dim)
-                key_layer = mixed_x_layer[:, :, each_hidden_size:each_hidden_size+each_hidden_size].reshape(seq_len, bs, -1, self.head_dim)
-                value_layer = mixed_x_layer[:, :, each_hidden_size+each_hidden_size:].reshape(seq_len, bs, -1, self.head_dim)
+                query_layer = mixed_x_layer[:, :, :each_hidden_size].contiguous().reshape(seq_len, bs, -1, self.head_dim)
+                key_layer = mixed_x_layer[:, :, each_hidden_size:each_hidden_size+each_hidden_size].contiguous().reshape(seq_len, bs, -1, self.head_dim)
+                value_layer = mixed_x_layer[:, :, each_hidden_size+each_hidden_size:].contiguous().reshape(seq_len, bs, -1, self.head_dim)
 
             # Repeat kv
             if self.use_gqa:
@@ -770,7 +771,6 @@ class ParallelAttention(MegatronModule):
         # ==================================
         # Adjust key and value for inference
         # ==================================
-
         # duplicate the pos_emb for self attention
         if rotary_pos_emb is not None:
             if isinstance(rotary_pos_emb, tuple):
@@ -820,13 +820,15 @@ class ParallelAttention(MegatronModule):
         # ==================================
         # core attention computation
         # ==================================
-
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
             if not self.enable_ds_sequence_parallel:
                 q_pos_emb, k_pos_emb = rotary_pos_emb
                 query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb)
                 key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb)
+                # cos, sin = rotary_pos_emb
+                # query_layer = apply_rotary_pos_emb(query_layer, cos, sin)
+                # key_layer = apply_rotary_pos_emb(key_layer, cos, sin)
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
@@ -1328,7 +1330,7 @@ class ParallelTransformerLayer(MegatronModule):
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
-        layernorm_output = self.input_layernorm(hidden_states)
+        layernorm_output = self.input_layernorm(hidden_states) # n_1
 
         # Self attention.
         try:
@@ -1349,9 +1351,9 @@ class ParallelTransformerLayer(MegatronModule):
             
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
-            residual = layernorm_output
+            residual = layernorm_output # n_1
         else:
-            residual = hidden_states
+            residual = hidden_states # x
 
         # FPDT does not support dropout yet.
         if not self.ds_sequence_parallel_fpdt:
@@ -1384,10 +1386,10 @@ class ParallelTransformerLayer(MegatronModule):
         else:
             if attention_bias is not None:
                 attention_output = attention_output + attention_bias
-            layernorm_input = attention_output + residual
+            layernorm_input = attention_output + residual # h + x
 
         # Layer norm post the self attention.
-        layernorm_output = self.post_attention_layernorm(layernorm_input)
+        layernorm_output = self.post_attention_layernorm(layernorm_input) # n_2
 
         # Cross attention.
         if self.layer_type == LayerType.encoder:

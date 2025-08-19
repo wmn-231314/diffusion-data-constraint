@@ -185,7 +185,7 @@ class UniversalCheckpointInfo:
         return patterns
 
 
-class GPTModel(MegatronModule):
+class DiffGPTModel(MegatronModule):
     """GPT-2 Language model."""
 
     def __init__(self,
@@ -209,7 +209,7 @@ class GPTModel(MegatronModule):
             config=config,
             num_tokentypes=num_tokentypes,
             add_pooler=False,
-            encoder_attn_mask_type=AttnMaskType.padding if args.randmask_ratio > 0 else AttnMaskType.causal,
+            encoder_attn_mask_type=AttnMaskType.padding,
             pre_process=self.pre_process,
             post_process=self.post_process,
             num_experts=args.num_experts)
@@ -304,8 +304,8 @@ class GPTModel(MegatronModule):
         return UniversalCheckpointInfo(using_model_pipe=False).get()
 
 
-def CrossEntropy(output, labels):
-    labels, loss_mask = labels[0], labels[1]
+def MaskedCrossEntropy(output, labels):
+    labels, loss_mask, masked_indices, p_mask = labels[0], labels[1], labels[2], labels[3]
 
     args = get_args()
 
@@ -314,12 +314,14 @@ def CrossEntropy(output, labels):
     losses = tensor_parallel.vocab_parallel_cross_entropy(output.contiguous().float(), labels)
     # [s b] => [b, s]
     losses = losses.transpose(0, 1).contiguous()
-    loss_mask = loss_mask.view(-1)
-    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    # loss_mask = loss_mask.view(-1)
+    # loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    losses = losses[masked_indices] / p_mask[masked_indices]
+    loss = losses.sum() / (masked_indices.shape[0] * masked_indices.shape[1])
     return loss
 
 
-class GPTModelPipe(PipelineModule,MegatronModule):
+class DiffGPTModelPipe(PipelineModule,MegatronModule):
     """GPT-2 Language model."""
 
     def __init__(self,
@@ -350,9 +352,13 @@ class GPTModelPipe(PipelineModule,MegatronModule):
 
         # Embedding layer
         if args.untie_embeddings_and_output_weights:
+            if args.untie_with_additional_mask:
+                vocab_size = args.padded_vocab_size + 1
+            else:
+                vocab_size = args.padded_vocab_size
             self.specs.append(LayerSpec(EmbeddingPipe,
                                         args.hidden_size,
-                                        args.padded_vocab_size,
+                                        vocab_size,
                                         args.max_position_embeddings,
                                         args.hidden_dropout,
                                         config,
@@ -388,7 +394,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                 LayerSpec(ParallelTransformerLayerPipe,
                           config,
                           layer_number=layer_idx,
-                          self_attn_mask_type=AttnMaskType.padding if args.randmask_ratio > 0 else AttnMaskType.causal,
+                          self_attn_mask_type=AttnMaskType.padding,
                           num_experts=experts_per_layer[layer_idx],
                           input_aggregated_moe_loss=(self.is_moe_model and layer_idx > 0),
                           return_aggregated_moe_loss=self.is_moe_model))
@@ -415,6 +421,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                 lm_output,
                 embedding.word_embeddings_weight,
                 self.parallel_output)
+                
         if args.untie_embeddings_and_output_weights:
             self.specs.append(
                 LayerSpec(LMHeadPipe, args.hidden_size, args.padded_vocab_size, config)
@@ -471,7 +478,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         return hidden
 
     def loss_func(self, output, labels):
-        loss = CrossEntropy(output, labels)
+        loss = MaskedCrossEntropy(output, labels)
         self.last_lm_loss = loss.clone().detach()
         if self.moe_loss is not None:
             loss += self.moe_loss

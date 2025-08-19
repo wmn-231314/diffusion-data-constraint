@@ -13,11 +13,13 @@ else:
         from .fused_rmsnorm import RMSNorm
     else:
         from .rmsnorm import RMSNorm
-    from .layernorm import SPLayerNorm as LayerNorm
+    from torch.nn import LayerNorm
 
 from .distributed import DistributedDataParallel
 from .bert_model import BertModel
 from .gpt_model import GPTModel, GPTModelPipe
+from .diff_gpt_model import DiffGPTModel, DiffGPTModelPipe
+from .target_gpt_model import TargetGPTModel, TargetGPTModelPipe
 from .t5_model import T5Model
 from .language_model import get_language_model
 from .module import Float16Module

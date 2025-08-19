@@ -1,0 +1,18 @@
+datasets
+nltk
+numpy
+parameterized
+pybind11
+regex
+six
+tensorboard
+torch>=1.7
+transformers
+ninja==1.11.1
+DeepSpeed @ git+https://github.com/microsoft/DeepSpeed.git
+# versions from HF transformers
+black==21.4b0
+isort>=5.5.4
+# flash-attn
+wandb
+ipdb

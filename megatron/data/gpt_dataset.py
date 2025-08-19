@@ -16,7 +16,6 @@ from megatron.data.dataset_utils import get_datasets_weights_and_num_samples
 from megatron.data.dataset_utils import get_train_valid_test_split_
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 
-
 def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                     train_valid_test_num_samples,
                                     seq_length, seed, skip_warmup,
@@ -165,6 +164,7 @@ def build_dataset(dataset_name, data_prefix, data_impl,
                   seq_length, seed, skip_warmup,
                   *,
                   data_cache_path=None):
+    args = get_args()
     dataset = None
     if len(data_prefix) == 1:
         dataset = _build_dataset(dataset_name, data_prefix[0], data_impl,
@@ -175,7 +175,14 @@ def build_dataset(dataset_name, data_prefix, data_impl,
         # Blending dataset.
         # Parse the values.
         output = get_datasets_weights_and_num_samples(data_prefix, num_samples)
-        prefixes, weights, dataset_num_samples = output
+        prefixes, weights, dataset_num_samples = output # three lists
+
+        # if using monte carlo sampling
+        if args.num_mc > 1 and dataset_name != 'train':
+            prefixes = prefixes * args.num_mc
+            weights = weights * args.num_mc
+            dataset_num_samples = dataset_num_samples * args.num_mc
+
         num_samples = sum(dataset_num_samples)
 
         # Build individual datasets.
@@ -228,7 +235,6 @@ def _build_dataset(dataset_name, data_prefix, data_impl, splits_string,
 def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
     """Build indexed dataset."""
     print_rank_0(' > building dataset index ...')
-
     start_time = time.time()
     indexed_dataset = make_indexed_dataset(data_prefix,
                                            data_impl,
@@ -331,7 +337,9 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     args = get_args()
     # Number of tokens in each epoch and number of required epochs.
     tokens_per_epoch = _num_tokens(documents, sizes)
+    print_rank_0(f"Tokens per epoch: {tokens_per_epoch}")
     num_epochs = _num_epochs(tokens_per_epoch, seq_length, num_samples)
+    print_rank_0(f"Number of epochs: {num_epochs}")
     if args.train_data_exact_num_epochs is not None and name == 'train':
         num_epochs = args.train_data_exact_num_epochs
 

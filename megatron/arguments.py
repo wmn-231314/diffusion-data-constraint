@@ -11,6 +11,7 @@ import torch
 import deepspeed
 import types
 from packaging import version
+import re
 
 import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
@@ -46,6 +47,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
     parser = _add_profiler_args(parser)
+    parser = _add_extra_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -65,7 +67,12 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    # args.deepspeed = False
 
+    # solve wandb
+    if args.wandb_group is None:
+        args.wandb_group = args.wandb_exp_name # make group same as exp name
+    
     return args
 
 def validate_args(args, defaults={}):
@@ -226,6 +233,7 @@ def validate_args(args, defaults={}):
     args.consumed_train_samples = 0
     args.consumed_valid_samples = 0
     args.consumed_train_tokens = 0
+    args.gigaflops_no_embeds = 0
 
     # Support for variable sequence lengths across batches/microbatches.
     # set it if the dataloader supports generation of variable sequence lengths
@@ -315,6 +323,15 @@ def validate_args(args, defaults={}):
     # to false to turn off absolute position embedding.
     if args.use_rotary_position_embeddings:
         args.add_position_embedding = False
+
+    if args.target_random_ratio > 0: # no target position embeddings all the time
+        args.target_random_ratio = 0.0
+        args.use_target_position_embeddings = False
+
+    if args.num_order_list > 0: # no order list all the time
+        args.num_order_list = 0
+        args.use_order_list = False
+
     if args.lr is not None:
         assert args.min_lr <= args.lr
     if args.save is not None:
@@ -499,6 +516,19 @@ def core_transformer_config_from_args(args):
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
 
     return TransformerConfig(**kw_args)
+
+def _add_extra_args(parser):
+    group = parser.add_argument_group(title='Extra')
+    group.add_argument('--low-noise-start', action='store_true',
+                       help='Use low noise start for diffusion model.')
+    group.add_argument('--low-noise-iter', type=int, default=1000,
+                       help='Number of iterations to use low noise.')
+    group.add_argument('--low-noise-ratio', type=float, default=0.5,
+                       help='Ratio of low noise.')
+    
+    group.add_argument('--untie-with-additional-mask', action='store_true',
+                       help='Untie the embeddings and add additional mask token (will make tensor parallel not work)')
+    return parser
 
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
@@ -758,7 +788,8 @@ def _add_logging_args(parser):
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
                        help='Path to save the wandb results locally.')
-
+    group.add_argument('--wandb-group', type=str, default='',
+                       help='The wandb group name.')
     return parser
 
 
@@ -990,6 +1021,34 @@ def _add_training_args(parser):
                        dest='gradient_accumulation_fusion')
     group.add_argument('--use-dataset-only', type=bool, required=False, default=False,
                        help='If set to True, only use the megatron dataset for external trainer ')
+    
+    group.add_argument('--ar-ratio', type=float, default=0.0,
+                       help='The ratio of the AR type masking during training')
+    
+    group.add_argument('--block-size', type=int, default=2048,
+                       help='The size of the block for the block diffusion model')
+    
+    group.add_argument('--randmask-ratio', type=float, default=0.0,
+                       help='The ratio of the random mask during training')
+    
+    group.add_argument('--target-random-ratio', type=float, default=0.0,
+                       help='The ratio of the target random during training')
+    
+    group.add_argument('--use-target-position-embeddings', type=bool, default=False,
+                       help='If set to True, use target position embeddings')
+    
+    group.add_argument('--use-order-list', type=bool, default=False,
+                       help='If set to True, use order list')
+    
+    group.add_argument('--num-order-list', type=int, default=0,
+                       help='The number of order list')
+    
+    group.add_argument('--order-list', type=list, default=None,
+                       help='The order list')
+    
+    group.add_argument('--use-predefined-order',action='store_true',
+                       help='If set to True, use predefined order')
+    
     return parser
 
 
@@ -1227,6 +1286,8 @@ def _add_validation_args(parser):
                        default=False, help='If set, bypass the training loop, '
                        'optionally do evaluation for validation/test, and exit.')
 
+    group.add_argument('--num-mc', type=int, default=1,
+                       help='Number of Monte Carlo samples for evaluation.')
     return parser
 
 
@@ -1263,6 +1324,29 @@ def _add_data_args(parser):
                        '1) a single data path, 2) multiple datasets in the'
                        'form: dataset1-weight dataset1-path dataset2-weight '
                        'dataset2-path ...')
+    
+    class parse_data_paths_path(argparse.Action):
+        def __call__(self, parser, namespace, file_path, option_string=None):
+            # Read the file
+            with open(file_path, 'r') as f:
+                lines = f.readlines()
+
+            assert len(lines) == 1, f"Expected only one line in the file, but got {len(lines)}"
+            line = lines[0].strip()
+            assert line.startswith('"') and line.endswith('"'), f"Line format invalid: {line}"
+            path_list = line[1:-1].split('" "')
+            parsed_values = []
+            for segment in path_list:
+                parts = segment.strip().split()
+                parsed_values.extend(parts)
+
+            target_dest = self.dest.replace('_file', '')
+            setattr(namespace, target_dest, parsed_values)
+
+    group.add_argument('--train-data-path-file', type=str, action=parse_data_paths_path ,default=None)
+    group.add_argument('--valid-data-path-file', type=str, action=parse_data_paths_path, default=None)
+    group.add_argument('--test-data-path-file', type=str, action=parse_data_paths_path, default=None)
+
     group.add_argument('--data-cache-path', default=None,
                        help='Path to a directory to hold cached index files.')
 

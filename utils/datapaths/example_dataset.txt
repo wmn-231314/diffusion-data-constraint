@@ -1,0 +1,1 @@
+"1.0 /path/to/your/trainset/<tokenized_file_name>"

@@ -607,6 +607,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             update_num_microbatches(consumed_samples=args.consumed_train_samples)
             args.consumed_valid_samples = getattr(checkpoint_args,
                                                 'consumed_valid_samples', 0)
+            args.gigaflops_no_embeds = getattr(checkpoint_args,
+                                          'gigaflops_no_embeds', 0)
         else:
             print_rank_0('could not find arguments in the checkpoint ...')
 

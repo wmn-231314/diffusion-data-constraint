@@ -27,26 +27,26 @@ class RotaryEmbedding(nn.Module):
         if importlib.util.find_spec('einops') is None:
             raise RuntimeError("einops is required for Rotary Embedding")
 
-    def forward(self, max_seq_len, offset=0):
-        seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
-        freqs = einsum('i , j -> i j', seq.type_as(self.inv_freq), self.inv_freq)
-        # first part even vector components, second part odd vector components,
-        #  2 * dim in dimension size
-        emb = torch.cat((freqs, freqs), dim=-1)
-        # emb [seq_length, .., dim]
-        from einops import rearrange
-        base = rearrange(emb, 'n d -> n 1 1 d')
-        rope = [base.cos(), base.sin()]
-        return rope
+    def forward(self, position_ids, offset=0):
+        # position_ids shape: [B, seq_length]
+        if isinstance(position_ids, int):
+            position_ids = torch.arange(position_ids, device=get_accelerator().current_device_name()).unsqueeze(0)
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+        position_ids_offset = position_ids + offset
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[1], -1, 1)
+        position_ids_expanded = position_ids_offset.transpose(0, 1)[:, None, :].float()
+        angle = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+        emb = torch.cat((angle, angle), dim=-1).unsqueeze(2)
+        # rope = (emb.cos(), emb.sin())
+        return emb
 
 
+# NOTE: change einops to improve efficiency
 def _rotate_half(x):
-    """
-    change sign so the last dimension becomes [-odd, +even]
-    """
-    from einops import rearrange
-    x = rearrange(x, '... (j d) -> ... j d', j=2)
-    x1, x2 = x.unbind(dim=-2)
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -62,14 +62,13 @@ def apply_rotary_pos_emb(t, freqs):
         # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
         t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
 
-    global cos_cached, sin_cached
-    if cos_cached is None or sin_cached is None or t.shape[0] != cos_cached.shape[0]:
-        freqs_ = freqs[:t.shape[0]]
-        cos_cached = freqs_.cos().to(t.dtype)
-        sin_cached = freqs_.sin().to(t.dtype)
+    freqs_ = freqs[:t.shape[0]]
+    cos = freqs_.cos().to(t.dtype)
+    sin = freqs_.sin().to(t.dtype)
+
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
-    t = (t * cos_cached) + (_rotate_half(t) * sin_cached)
+    t = (t * cos) + (_rotate_half(t) * sin)
     if t_pass is None:
         return t
     return torch.cat((t, t_pass), dim=-1)
