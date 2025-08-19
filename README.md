@@ -4,7 +4,7 @@
 # **Diffusion Beats Autoregressive in Data-Constrained Settings**
 [![Diffusion-scaling](preview.png)](preview.png)
 
-[![arXiv](https://img.shields.io/badge/cs.CV-arXiv:2507.15857-b31b1b.svg)](https://arxiv.org/abs/2507.15857)
+[![arXiv](https://img.shields.io/badge/cs.LG-arXiv:2507.15857-b31b1b.svg)](https://arxiv.org/abs/2507.15857)
 [![Website](https://img.shields.io/badge/🌎-Website-blue.svg)](http://diffusion-scaling.github.io)
 </div>
 
@@ -92,3 +92,15 @@ This codebase is built upon several foundational repositories and implementation
 - **Implementation References**: Incorporates modifications for data preprocessing and improvements from [TurkuNLP's Megatron-DeepSpeed](https://github.com/TurkuNLP/Megatron-DeepSpeed)
 - **Core Methodology**: Implements Masked Diffusion Model architecture and evaluation based on [SMDM](https://github.com/ML-GSAI/SMDM) research and implementation
 
+## Citation
+
+If you find this work useful in your research, please cite:
+
+```bibtex
+@article{prabhudesai2025diffusion,
+  title={Diffusion Beats Autoregressive in Data-Constrained Settings},
+  author={Prabhudesai, Mihir and Wu, Menging and Zadeh, Amir and Fragkiadaki, Katerina and Pathak, Deepak},
+  journal={arXiv preprint arXiv:2507.15857},
+  year={2025}
+}
+```
