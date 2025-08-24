@@ -241,6 +241,7 @@ In this work, we explore the data utilization ability of Diffusion and Autoregre
     - For Diffusion, we use model 117M (123.6M) : `DATA_CNT = 1e19 / 6 / 123.6M = 13.5B`, so choose dataset `c4_13B5_100ep.json`
 - For the exact model parameter for each model name, please refer to Section 10 of our paper.
 - To create these datasets, we use the accurate model parameter to calculate accurate sample count.
+- Some datasets are too large to be directly uploaded, so we slice them into pieces, use `cat data_line_shards/c4_12B.part-*\.jsonl > c4_12B.jsonl` to concatenate them.
 
 
 ### Left-to-Right Masking on MDM
