@@ -177,7 +177,7 @@ DEEPSPEED_ARGS=" \
     "
 
 CMD=" \
-    /path/to/your/project/Megatron-DeepSpeed/pretrain_gpt.py \
+    pretrain_gpt.py \
     --tensor-model-parallel-size $TP_SIZE \
     --pipeline-model-parallel-size $PP_SIZE \
     --no-pipeline-parallel \

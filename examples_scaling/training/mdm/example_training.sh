@@ -166,7 +166,7 @@ DEEPSPEED_ARGS=" \
     "
 
 CMD=" \
-    /path/to/your/project/Megatron-DeepSpeed/pretrain_diff_gpt.py \
+    pretrain_diff_gpt.py \
     --tensor-model-parallel-size $TP_SIZE \
     --pipeline-model-parallel-size $PP_SIZE \
     $GPT_ARGS \

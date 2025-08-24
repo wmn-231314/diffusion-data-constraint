@@ -50,9 +50,9 @@ EPOCH_CNT=500
 echo "Model parameters: d_model $NHIDDEN ffw_size $FFN_HIDDEN_SIZE kv_size $KV_SIZE n_heads $NHEADS n_layers $NLAYERS"
 
 SAVE_INTERVAL=1000
-EVAL_INTERVAL=1000
+EVAL_INTERVAL=1
 LOG_INTERVAL=10
-EVAL_ITERS=10
+EVAL_ITERS=100
 
 # Tokens: 1516071000
 # -> Samples: 740269
@@ -103,7 +103,7 @@ GPT_ARGS=" \
 
 OUTPUT_ARGS=" \
     --skip-train \
-    --num-mc 16 \
+    --num-mc 8 \
     --log-interval $LOG_INTERVAL \
     --save-interval $SAVE_INTERVAL \
     --eval-interval $EVAL_INTERVAL \

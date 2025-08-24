@@ -18,14 +18,14 @@ Autoregressive (AR) models have long dominated the landscape of large language m
 
 
 ## TODOS
-- [x] Quick Start Instructions
-- [x] Installation Instructions
-- [x] Data Preprocessing Instructions
-- [x] Model Pretraining Instructions
-- [x] Model Evaluation Instructions
-- [ ] Additional Experiments Configurations in the paper
+- [x] [Quick Start Instructions](#quick-start-instructions)
+- [x] [Installation Instructions](FULL_README.md#installation)
+- [x] [Data Preprocessing Instructions](FULL_README.md#data-preprocessing)
+- [x] [Model Pretraining Instructions](examples_scaling/training/TRAIN.md)
+- [x] [Model Evaluation Instructions](examples_scaling/evaluation/EVAL.md)
+- [x] [Release all the Subset Datasets](https://huggingface.co/datasets/ZahlenReal/diffusion_data_constraint_c4subsets)
+- [ ] [Additional Experiments Configurations in the paper](examples_scaling/training/TRAIN.md#different-experimental-configurations)
 - [ ] Downstream Instructions
-- [ ] Release all the Subset Datasets
 - [ ] Release Pretrained Checkpoints
 
 
@@ -72,6 +72,9 @@ Use our best configurations for the 100M token scenario to train both AR and Dif
 
 **Expected Result:** Diffusion should achieve lower validation loss and better downstream performance compared to AR when training on limited data.
 
+**Pretrained Checkpoints:**
+We provided the pretrained checkpoints for the best configurations for AR and Diffusion models trained on 100M tokens in [Hugging Face](https://huggingface.co/ZahlenReal/diffusion_data_constraint_models/tree/main/100m_new).
+
 ## Full README
 
 For comprehensive instructions on training models with different configurations, data preprocessing, and advanced experimental setups, please refer to [FULL_README.md](FULL_README.md).
@@ -99,7 +102,7 @@ If you find this work useful in your research, please cite:
 ```bibtex
 @article{prabhudesai2025diffusion,
   title={Diffusion Beats Autoregressive in Data-Constrained Settings},
-  author={Prabhudesai, Mihir and Wu, Menging and Zadeh, Amir and Fragkiadaki, Katerina and Pathak, Deepak},
+  author={Prabhudesai, Mihir and Wu, Mengning and Zadeh, Amir and Fragkiadaki, Katerina and Pathak, Deepak},
   journal={arXiv preprint arXiv:2507.15857},
   year={2025}
 }

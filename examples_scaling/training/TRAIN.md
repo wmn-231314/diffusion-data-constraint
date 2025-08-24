@@ -210,7 +210,40 @@ We provide a multi-node training script that modifies the slurm header for multi
 
 
 ## Different Experimental Configurations
-### Same Compute with Different Epoch Count (Data Utilization Ability)
+
+### LR Exploration
+
+We tested different combinations of beta2, learning rate, minimum learning rate, and warmup step proportions.
+
+**Results:**
+- AR models perform best with default settings
+- Diffusion models show slight improvement with higher LR and warmup proportion
+
+**Note:** We use identical optimization parameters for both AR and Diffusion to ensure fair comparison across experiments.
+
+### Chinchilla Scaling Law
+In this work, we fitted "data constrained" scaling law for both Autoregressive and Diffusion models, which is introduced in Section 3.3 of our paper. To get this equation, we first need to find the variables for the chinchilla scaling law, and based on our experiments, we found that the compute-optimal settings are following the chinchilla scaling law and the diffusion scaling relationship found in the paper "Scaling up Masked Diffusion Models on Text". The experiments are conducted on 4 different compute scales: 6e18, 1e19, 3e19, 1e20. To verify this result, we provide example scripts in [mdm/example_training_chinchilla.sh](./mdm/example_training_chinchilla.sh) and [arm/example_training_chinchilla.sh](./arm/example_training_chinchilla.sh). Since chinchilla scaling law is a single epoch experiment, we directly use full c4 dataset for training.
+
+**NOTE**: In addition to the unfilled path, the only thing you need to change is the 'MODEL_PARAM' and the 'FLOPS_FACTOR' in the example script.
+
+
+### Data Utilization Ability
+In this work, we explore the data utilization ability of Diffusion and Autoregressive models. For each model architecture, we use the compute-optimal setting under compute 1e19, 3e19, 1e20 to find the data value decay with epoch repetition. Based on the previous experiment, we found that the compute-optimal setting under 1e19 is 217M for AR and 117M for Diffusion; the compute-optimal setting under 3e19 is 425M for AR and 217M for Diffusion; the compute-optimal setting under 1e20 is 724M for AR and 425M for Diffusion. In addition, we conduct experiments on 1, 2, 4, 10, 20, 50, 100 epochs (or 100%, 50%, 25%, 10%, 5%, 2%, 1% unique percentage). To verify the result shown in the paper Figure 3, 4 and 5, we provide example scripts in [mdm/example_training_data_value.sh](./mdm/example_training_data_value.sh) and [arm/example_training_data_value.sh](./arm/example_training_data_value.sh) and the corresponding data subsets [here](https://huggingface.co/datasets/ZahlenReal/diffusion_data_constraint_c4subsets).
+
+**NOTE**: The variables you need to change is the same as the chinchilla scaling law experiment.
+
+**How to calculate the corresponding dataset size:**
+- Given a fixed FLOPS, we can directly calculate the total unique token count for single epoch training using the following equation:
+    - `DATA_CNT = FLOPS_FACTOR * BILLION / 6`
+- Then for multi-epoch training, we create subsets by `DATA_CNT_PER_EPOCH = DATA_CNT / EPOCH_CNT`, and all of them are named with a postfix of `_EPOCH_CNT`, e.g. `c4_7B6_2ep.json`.
+- For example, if you want to try a data value experiment with 100 epochs in 1e19 compute:
+    - For AR, we use model 217M (217.5M) : `DATA_CNT = 1e19 / 6 / 217.5M = 7.6B`, so choose dataset `c4_7B6_100ep.json`
+    - For Diffusion, we use model 117M (123.6M) : `DATA_CNT = 1e19 / 6 / 123.6M = 13.5B`, so choose dataset `c4_13B5_100ep.json`
+- For the exact model parameter for each model name, please refer to Section 10 of our paper.
+- To create these datasets, we use the accurate model parameter to calculate accurate sample count.
+
+
+### Left-to-Right Masking on MDM
 
 TODO
 
@@ -224,19 +257,9 @@ TODO
 TODO
 
 
-### Left-to-Right Masking on MDM
+### Predefined Order Perturbation
 
 TODO
-
-### LR Exploration
-
-We tested different combinations of beta2, learning rate, minimum learning rate, and warmup step proportions.
-
-**Results:**
-- AR models perform best with default settings
-- Diffusion models show slight improvement with higher LR and warmup proportion
-
-**Note:** We use identical optimization parameters for both AR and Diffusion to ensure fair comparison across experiments.
 
 
 

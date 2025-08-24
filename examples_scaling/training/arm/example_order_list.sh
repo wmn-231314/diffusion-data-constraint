@@ -1,10 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=example_run_name
 #SBATCH --partition=your_partition
-#SBATCH --ntasks-per-node=1
-#SBATCH --nodes=k (k > 1)
 #SBATCH --time=your_time
 #SBATCH --gres=gpu:your_gpu_num
+#SBATCH --constraint='your_gpu_type'
 #SBATCH --cpus-per-task=your_cpu_num
 #SBATCH --mem=your_mem
 #SBATCH --mail-type=END,FAIL,RUNNING
@@ -12,14 +11,16 @@
 #SBATCH --output=your_output_dir/output_report-%j.out
 #SBATCH --requeue
 
+export CUDA_VISIBLE_DEVICES=your_gpu_ids
 export WANDB_API_KEY=your_wandb_api_key
-MASTER_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-MASTER_PORT=$((RANDOM%16384+49152))  # 49152-65535 random
+
+export MASTER_PORT=$((RANDOM%16384+49152))  # 49152-65535 random
 ARCH=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
 BUILD_NAME="build_${ARCH}"
 export BUILD_NAME
 
-VARIANT=$SLURM_JOB_NAME
+VARIANT=example_run_name
+
 echo "Running variant: $VARIANT"
 
 KILL_SWITCH_NAME=kill-switch-$VARIANT
@@ -43,12 +44,12 @@ VALID_DATA_PATH=utils/datapaths/example_valset.txt
 PP_SIZE=1
 TP_SIZE=1
 
-MICRO_BATCH_SIZE=2
+MICRO_BATCH_SIZE=micro_batch_size
 GLOBAL_BATCH_SIZE=256
 
 # Model parameters
 source utils/model_params.sh
-MODEL_PARAM=("${PARAM_2298M[@]}")
+MODEL_PARAM=("${PARAM_model_size[@]}")
 NHIDDEN=${MODEL_PARAM[0]}
 FFN_HIDDEN_SIZE=${MODEL_PARAM[1]}
 KV_SIZE=${MODEL_PARAM[2]}
@@ -58,8 +59,8 @@ SEQ_LEN=2048
 
 # Data Count
 source utils/epoch_tokens.sh
-DATA_CNT=${DATA_500M[@]}
-EPOCH_CNT=363
+DATA_CNT=${DATA_token_num[@]}
+EPOCH_CNT=epoch_num
 
 echo "Model parameters: d_model $NHIDDEN ffw_size $FFN_HIDDEN_SIZE kv_size $KV_SIZE n_heads $NHEADS n_layers $NLAYERS"
 
@@ -113,6 +114,9 @@ GPT_ARGS=" \
     --normalization rmsnorm \
     --swiglu \
     --bf16 \
+    # NOTE: Core parameters for order list
+    --num-order-list 10 \
+    --use-predefined-order \
     $OPTIMIZER_ARGS \
     "
 
@@ -140,7 +144,7 @@ DATA_ARGS=" \
     --data-impl mmap \
     "
 
-ZERO_STAGE=1
+ZERO_STAGE=0
 mkdir -p ds_configs
 DS_CONFIG_PATH="ds_configs/$VARIANT.json"
 
@@ -150,17 +154,7 @@ cat <<EOF > $DS_CONFIG_PATH
     "train_batch_size": $GLOBAL_BATCH_SIZE,
     "gradient_clipping": 1.0,
     "zero_optimization": {
-        "stage": $ZERO_STAGE,
-        "offload_optimizer": {
-            "device": "cpu",
-            "pin_memory": true
-        },
-        "offload_param": {
-            "device": "cpu",
-            "pin_memory": true
-        },
-        "contiguous_gradients": true,
-        "overlap_comm": true
+        "stage": $ZERO_STAGE
     },
     "bf16": {
         "enabled": true
@@ -177,24 +171,15 @@ DEEPSPEED_ARGS=" \
     "
 
 CMD=" \
-    pretrain_diff_gpt.py \
+    pretrain_gpt.py \
     --tensor-model-parallel-size $TP_SIZE \
     --pipeline-model-parallel-size $PP_SIZE \
-    --no-pipeline-parallel \
-    --cpu-optimizer \
     $GPT_ARGS \
     $OUTPUT_ARGS \
     $DATA_ARGS \
     $DEEPSPEED_ARGS \
     "
 
-echo "Launching on $SLURMD_NODENAME ($SLURM_PROCID/$SLURM_JOB_NUM_NODES)," \
-     "master $MASTER_NODE port $MASTER_PORT," \
-     "GPUs $SLURM_GPUS_ON_NODE," \
-     "CUDA: $(python -c 'import torch; print(torch.cuda.is_available())')"
+LAUNCHER="deepspeed --master_port $MASTER_PORT"
 
-echo "START $SLURM_JOBID: $(date)"
-
-srun --label examples_scaling/training/launch.sh $CMD
-
-echo "END $SLURM_JOBID: $(date)"
+$LAUNCHER $CMD

@@ -1,10 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=example_run_name
 #SBATCH --partition=your_partition
-#SBATCH --ntasks-per-node=1
-#SBATCH --nodes=k (k > 1)
 #SBATCH --time=your_time
 #SBATCH --gres=gpu:your_gpu_num
+#SBATCH --constraint='your_gpu_type'
 #SBATCH --cpus-per-task=your_cpu_num
 #SBATCH --mem=your_mem
 #SBATCH --mail-type=END,FAIL,RUNNING
@@ -12,14 +11,16 @@
 #SBATCH --output=your_output_dir/output_report-%j.out
 #SBATCH --requeue
 
+export CUDA_VISIBLE_DEVICES=your_gpu_ids
 export WANDB_API_KEY=your_wandb_api_key
-MASTER_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-MASTER_PORT=$((RANDOM%16384+49152))  # 49152-65535 random
+
+export MASTER_PORT=$((RANDOM%16384+49152))  # 49152-65535 random
 ARCH=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
 BUILD_NAME="build_${ARCH}"
 export BUILD_NAME
 
-VARIANT=$SLURM_JOB_NAME
+VARIANT=example_run_name
+
 echo "Running variant: $VARIANT"
 
 KILL_SWITCH_NAME=kill-switch-$VARIANT
@@ -37,29 +38,24 @@ WANDB_PATH=/path/to/your/wandb/dir/$WANDB_NAME
 
 VOCAB_FILE=utils/data/gpt2-vocab.json
 MERGE_FILE=utils/data/gpt2-merges.txt
-TRAIN_DATA_PATH=utils/datapaths/example_trainset.txt
-VALID_DATA_PATH=utils/datapaths/example_valset.txt
+TRAIN_DATA_PATH=utils/datapaths/train_c4_full.txt
+VALID_DATA_PATH=utils/datapaths/val_c4.txt
 
 PP_SIZE=1
 TP_SIZE=1
 
-MICRO_BATCH_SIZE=2
+MICRO_BATCH_SIZE=16
 GLOBAL_BATCH_SIZE=256
 
 # Model parameters
 source utils/model_params.sh
-MODEL_PARAM=("${PARAM_2298M[@]}")
+MODEL_PARAM=("${PARAM_model_size[@]}")
 NHIDDEN=${MODEL_PARAM[0]}
 FFN_HIDDEN_SIZE=${MODEL_PARAM[1]}
 KV_SIZE=${MODEL_PARAM[2]}
 NHEADS=${MODEL_PARAM[3]}
 NLAYERS=${MODEL_PARAM[4]}
 SEQ_LEN=2048
-
-# Data Count
-source utils/epoch_tokens.sh
-DATA_CNT=${DATA_500M[@]}
-EPOCH_CNT=363
 
 echo "Model parameters: d_model $NHIDDEN ffw_size $FFN_HIDDEN_SIZE kv_size $KV_SIZE n_heads $NHEADS n_layers $NLAYERS"
 
@@ -68,18 +64,23 @@ EVAL_INTERVAL=1000
 LOG_INTERVAL=10
 EVAL_ITERS=10
 
-# Tokens: 1516071000
-# -> Samples: 740269
-TRAIN_SAMPLES=$((DATA_CNT*EPOCH_CNT/SEQ_LEN))
-WARMUP_SAMPLES=$((TRAIN_SAMPLES/100))
-
-echo "Training samples: $TRAIN_SAMPLES, Number of epochs: $EPOCH_CNT, Data count: $DATA_CNT"
-
+# Calculate training samples based on flops
+FLOPS_FACTOR=6 # change to 6(6e18), 10(1e19), 30(3e19), 100(1e20)
+BILLION=1000000000 # don't change this
+FLOPS_BILLION=$((FLOPS_FACTOR*BILLION))
 VOCAB_SIZE=50257
 NEW_FFN_HIDDEN_SIZE=$(python3 -c "print(int((4 * $NHIDDEN * 2 / 3) / 64) * 64)")
 MODEL_PARAM_CNT=$(python3 -c "print(4 * $NLAYERS * ($NHIDDEN ** 2) + 3 * $NLAYERS * $NHIDDEN * $NEW_FFN_HIDDEN_SIZE + 6*$NLAYERS*$NHIDDEN + ($VOCAB_SIZE * $NHIDDEN))")
+DATA_CNT=$(python3 -c "print(int(($FLOPS_BILLION/6) * ($BILLION / $MODEL_PARAM_CNT)))")
 
-echo "Model parameters: $MODEL_PARAM_CNT, New ffn hidden size: $NEW_FFN_HIDDEN_SIZE"
+echo "Training FLOPS(Billion): $FLOPS_BILLION, Model parameters: $MODEL_PARAM_CNT, Data count: $DATA_CNT"
+
+# Tokens: 1516071000
+# -> Samples: 740269, sample=token/seq_len
+TRAIN_SAMPLES=$(python3 -c "print(round($DATA_CNT / $SEQ_LEN))")
+WARMUP_SAMPLES=$(python3 -c "print(max(round($TRAIN_SAMPLES / 100), 100))")
+
+echo "Training samples: $TRAIN_SAMPLES, warmup samples: $WARMUP_SAMPLES"
 
 OPTIMIZER_ARGS=" \
     --optimizer adam \
@@ -140,7 +141,7 @@ DATA_ARGS=" \
     --data-impl mmap \
     "
 
-ZERO_STAGE=1
+ZERO_STAGE=0
 mkdir -p ds_configs
 DS_CONFIG_PATH="ds_configs/$VARIANT.json"
 
@@ -150,17 +151,7 @@ cat <<EOF > $DS_CONFIG_PATH
     "train_batch_size": $GLOBAL_BATCH_SIZE,
     "gradient_clipping": 1.0,
     "zero_optimization": {
-        "stage": $ZERO_STAGE,
-        "offload_optimizer": {
-            "device": "cpu",
-            "pin_memory": true
-        },
-        "offload_param": {
-            "device": "cpu",
-            "pin_memory": true
-        },
-        "contiguous_gradients": true,
-        "overlap_comm": true
+        "stage": $ZERO_STAGE
     },
     "bf16": {
         "enabled": true
@@ -177,24 +168,15 @@ DEEPSPEED_ARGS=" \
     "
 
 CMD=" \
-    pretrain_diff_gpt.py \
+    pretrain_gpt.py \
     --tensor-model-parallel-size $TP_SIZE \
     --pipeline-model-parallel-size $PP_SIZE \
-    --no-pipeline-parallel \
-    --cpu-optimizer \
     $GPT_ARGS \
     $OUTPUT_ARGS \
     $DATA_ARGS \
     $DEEPSPEED_ARGS \
     "
 
-echo "Launching on $SLURMD_NODENAME ($SLURM_PROCID/$SLURM_JOB_NUM_NODES)," \
-     "master $MASTER_NODE port $MASTER_PORT," \
-     "GPUs $SLURM_GPUS_ON_NODE," \
-     "CUDA: $(python -c 'import torch; print(torch.cuda.is_available())')"
+LAUNCHER="deepspeed --master_port $MASTER_PORT"
 
-echo "START $SLURM_JOBID: $(date)"
-
-srun --label examples_scaling/training/launch.sh $CMD
-
-echo "END $SLURM_JOBID: $(date)"
+$LAUNCHER $CMD
