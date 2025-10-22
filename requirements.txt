@@ -9,7 +9,7 @@ tensorboard
 torch>=1.7
 transformers
 ninja==1.11.1
-DeepSpeed @ git+https://github.com/microsoft/DeepSpeed.git
+DeepSpeed @ git+https://github.com/microsoft/DeepSpeed.git@f355b9ea
 # versions from HF transformers
 black==21.4b0
 isort>=5.5.4
