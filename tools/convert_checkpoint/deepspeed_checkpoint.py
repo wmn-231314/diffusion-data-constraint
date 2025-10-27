@@ -67,26 +67,26 @@ class DeepSpeedCheckpoint(object):
         self._dump_mapping(self.transformer_file_map, 'rank_to_tranformer_files')
 
     def _build_global_state(self):
-        sd = torch.load(self.mp_rank_files[0], map_location=torch.device('cpu'))
+        sd = torch.load(self.mp_rank_files[0], map_location=torch.device('cpu'), weights_only=False)
         self.global_state[ITERATION_KEY] = sd.get(ITERATION_KEY, 0)
         self.global_state[ARGS_KEY] = sd.get(ARGS_KEY, None)
 
     def get_iteration(self):
         if not ITERATION_KEY in self.global_state:
-            sd = torch.load(self.mp_rank_files[0], map_location=torch.device('cpu'))
+            sd = torch.load(self.mp_rank_files[0], map_location=torch.device('cpu'), weights_only=False)
             self.global_state[ITERATION_KEY] = sd.get(ITERATION_KEY, 0)
 
         return self.global_state[ITERATION_KEY]
 
     def get_embedding_state(self, tp_index: int) -> Dict:
         assert tp_index in self.tp_to_embedding_map.keys()
-        sd_list = [torch.load(fname, map_location=torch.device('cpu')) for fname in self.tp_to_embedding_map[tp_index]]
+        sd_list = [torch.load(fname, map_location=torch.device('cpu'), weights_only=False) for fname in self.tp_to_embedding_map[tp_index]]
         sd = self._merge_state_dicts(sd_list)
         return sd
 
     def get_args(self):
         if not ARGS_KEY in self.global_state:
-            sd = torch.load(self.mp_rank_files[0], map_location=torch.device('cpu'))
+            sd = torch.load(self.mp_rank_files[0], map_location=torch.device('cpu'), weights_only=False)
             self.global_state[ARGS_KEY] = sd.get(ARGS_KEY, None)
 
         return self.global_state[ARGS_KEY]
@@ -97,14 +97,14 @@ class DeepSpeedCheckpoint(object):
         assert pp_index < self.pp_degree
         t_list = []
         for fname_list in self.transformer_file_map[(tp_index, pp_index)]:
-            sd_list = [torch.load(fname, map_location=torch.device('cpu')) for fname in fname_list]
+            sd_list = [torch.load(fname, map_location=torch.device('cpu'), weights_only=False) for fname in fname_list]
             sd = self._merge_state_dicts(sd_list)
             t_list.append(sd)
         return t_list   
 
     def get_final_norm_state(self, tp_index:int) -> Dict:
         assert tp_index in self.tp_to_final_norm_map.keys()
-        sd = torch.load(self.tp_to_final_norm_map[tp_index][0], map_location=torch.device('cpu'))
+        sd = torch.load(self.tp_to_final_norm_map[tp_index][0], map_location=torch.device('cpu'), weights_only=False)
         return sd
 
     def _build_tp_other_layer_map(self, layer_index:int):
