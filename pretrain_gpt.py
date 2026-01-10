@@ -111,6 +111,18 @@ def get_batch(data_iterator, eps=1e-3):
     micro_batch_size = tokens_.size(0)
     seq_length = args.seq_length
 
+    if args.use_order_list:
+        # random select one order list
+        order_list = args.order_list
+        shuffled_position_ids = torch.zeros((micro_batch_size, seq_length), dtype=torch.long, device=tokens_.device)
+        idx = torch.randint(0, len(order_list), (micro_batch_size,))
+        for i in range(micro_batch_size):
+            order = order_list[idx[i]].to(tokens_.device).clone()
+            # keep 0 token fixed
+            tokens_[i, 1:] = tokens_[i, 1:][order]
+            order += 1 # 0 is reserved for the first token
+            shuffled_position_ids[i, 1:] = order[:-1]
+
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
 
@@ -123,6 +135,9 @@ def get_batch(data_iterator, eps=1e-3):
         args.reset_attention_mask,
         args.eod_mask_loss,
         skip_mask)
+
+    if args.use_order_list:
+        position_ids = shuffled_position_ids
     
     if args.randmask_ratio > 0:
         # extand attention mask to 3D
@@ -210,6 +225,18 @@ def get_batch_pipe(data, eps=1e-3):
     micro_batch_size = tokens_.size(0)
     seq_length = args.seq_length
 
+    if args.use_order_list:
+        # random select one order list
+        order_list = args.order_list
+        shuffled_position_ids = torch.zeros((micro_batch_size, seq_length), dtype=torch.long, device=tokens_.device)
+        idx = torch.randint(0, len(order_list), (micro_batch_size,))
+        for i in range(micro_batch_size):
+            order = order_list[idx[i]].to(tokens_.device).clone()
+            # keep 0 token fixed
+            tokens_[i, 1:] = tokens_[i, 1:][order]
+            order += 1 # 0 is reserved for the first token
+            shuffled_position_ids[i, 1:] = order[:-1]
+
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
 
@@ -220,6 +247,9 @@ def get_batch_pipe(data, eps=1e-3):
         args.reset_position_ids,
         args.reset_attention_mask,
         args.eod_mask_loss)
+
+    if args.use_order_list:
+        position_ids = shuffled_position_ids
         
     # update rotary pos emb
     if args.use_rotary_position_embeddings:

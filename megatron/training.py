@@ -1522,10 +1522,15 @@ def evaluate_and_print_results(prefix, forward_step_func,
     # set randmask to 0
     old_randmask_ratio = args.randmask_ratio
     old_ar_ratio = args.ar_ratio
+    old_use_order_list = args.use_order_list
+
     args.randmask_ratio = 0.0
     args.ar_ratio = 0.0
+    args.use_order_list = False
+
     print_rank_0(f"Setting randmask_ratio to 0 for evaluation")
     print_rank_0(f"Setting ar_ratio to 0 for evaluation")
+    print_rank_0(f"Setting use_order_list to False for evaluation")
 
     if write_to_tensorboard:
         writer = interop_tool_logger(tb_writer=get_tensorboard_writer(), wandb_writer=get_wandb_writer())
@@ -1582,8 +1587,11 @@ def evaluate_and_print_results(prefix, forward_step_func,
     # reset randmask_ratio
     args.randmask_ratio = old_randmask_ratio
     args.ar_ratio = old_ar_ratio
+    args.use_order_list = old_use_order_list
+
     print_rank_0(f"Resetting randmask_ratio to {old_randmask_ratio} for evaluation")
     print_rank_0(f"Resetting ar_ratio to {old_ar_ratio} for evaluation")
+    print_rank_0(f"Resetting use_order_list to {old_use_order_list} for evaluation")
 
 
 def cyclic_iter(iter):

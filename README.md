@@ -26,7 +26,7 @@ Autoregressive (AR) models have long dominated the landscape of large language m
 - [x] [Release all the Subset Datasets](https://huggingface.co/datasets/ZahlenReal/diffusion_data_constraint_c4subsets)
 - [x] [Release Pretrained Checkpoints](https://huggingface.co/ZahlenReal/diffusion_data_constraint_models/tree/main/100m_new)
 - [x] [Downstream Instructions](examples_scaling/downstream/DOWNSTREAM.md)
-- [ ] [Additional Experiments Configurations in the paper](examples_scaling/training/TRAIN.md#different-experimental-configurations)
+- [x] [Additional Experiments Configurations in the paper](examples_scaling/training/TRAIN.md#different-experimental-configurations)
 
 
 ## Quick Start Instructions

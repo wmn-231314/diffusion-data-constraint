@@ -328,9 +328,45 @@ def validate_args(args, defaults={}):
         args.target_random_ratio = 0.0
         args.use_target_position_embeddings = False
 
-    if args.num_order_list > 0: # no order list all the time
-        args.num_order_list = 0
-        args.use_order_list = False
+    # if args.num_order_list > 0: # no order list all the time
+    #     args.num_order_list = 0
+    #     args.use_order_list = False
+
+    if args.num_order_list > 0:
+        args.use_order_list = True
+
+    if args.use_order_list:
+        if args.num_order_list < 1:
+            print(f"INFO: num_order_list is less than 1, set to 1")
+        args.num_order_list = max(1, args.num_order_list) # at least 1 order list
+
+    seq_length = args.seq_length
+    # create order list
+    if args.use_order_list:
+        # use max length to create order list
+        order_list = []
+        # add raster order
+        order_list.append(torch.arange(seq_length))
+
+        # setup random seed
+        torch.manual_seed(args.seed)
+
+        if args.use_predefined_order:
+            for i in range(args.num_order_list - 1):
+                base = torch.arange(seq_length)
+                noise = torch.randn(seq_length) * (i+1)
+                scores = base + noise
+                order = torch.argsort(scores)
+                order_list.append(order)
+        else:
+            # add random order
+            for _ in range(args.num_order_list - 1):
+                order_list.append(torch.randperm(seq_length))
+        
+        
+        # add order list
+        args.order_list = order_list
+        print(f"INFO: order list: {order_list}")
 
     if args.lr is not None:
         assert args.min_lr <= args.lr

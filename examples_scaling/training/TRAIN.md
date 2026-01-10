@@ -244,23 +244,66 @@ In this work, we explore the data utilization ability of Diffusion and Autoregre
 - Some datasets are too large to be directly uploaded, so we slice them into pieces, use `cat data_line_shards/c4_12B.part-*\.jsonl > c4_12B.jsonl` to concatenate them.
 
 
-### Left-to-Right Masking on MDM
+### Predefined Order Perturbation
 
-TODO
+This experiment explores the impact of predefined order perturbation on model training by rearranging the positions of tokens in input sequences to study the effect of augmented token order. Example script is provided in `example_order_list.sh`, which is only for Autoregressive (AR) models. 
+
+**The only difference between this script and the standard training script is the addition of arguments below (under GPT_ARGS):**
+- `--use-order-list` (bool, default=False): Enable order list functionality, it will be set to True automatically if `--num-order-list` is larger than 0
+- `--num-order-list` (int, default=0): Specify the number of order lists
+- `--use-predefined-order` (action='store_true'): Use predefined order generation strategy, if not set, the system will use random order generation strategy
+
+**Experimental Mechanism:**
+When order lists are enabled, the system creates multiple different sequence permutation methods:
+
+1. **Raster Order**: Maintains original sequence order `[0, 1, 2, ..., seq_length-1]`
+2. **Predefined Order**: Generated based on noise-added sorting with increasing noise intensity per list index
+3. **Random Order**: Completely random sequence permutation
+
+**Training Process:**
+In each training step:
+- Randomly select one order list
+- Apply different permutation orders to each sample in the batch
+- Keep the first token (position 0) fixed
+- Update position ids to match the new token arrangement
+
 
 ### Attention Dropout
 
-TODO
+This experiment explores the impact of attention dropout, whether adding attention dropout as a form of data augmentation can improve AR model performance under data constraints.
+
+**The only difference between this script and the standard training script is the addition of arguments below (under GPT_ARGS):**
+- `--attention-dropout` (float, default=0.1): Dropout probability applied to attention weights after softmax
 
 
 ### Token Masking
 
-TODO
+This experiment implements token masking through attention mask manipulation to study whether diffusion models' superior performance is due to their implicit token masking effects. By randomly masking out tokens via attention mask, we create implicit data augmentation where the same sequence exposes different token visibility patterns across training steps.
 
+**The only difference between this script and the standard training script is the addition of arguments below (under GPT_ARGS):**
+- `--randmask-ratio` (float, default=0.0): Probability ratio for randomly masking tokens via attention mask
 
-### Predefined Order Perturbation
+**Training Process:**
+When `randmask_ratio > 0`, during each training step:
+- Randomly selects which tokens will be masked (controlled by `randmask_ratio`)
+- For each masked token, generates a position-dependent probability mask to control which past tokens it can attend to
+- Modifies the attention mask to block masked tokens from seeing selected past tokens (tokens always attend to themselves)
+- Effectively masks out tokens by preventing attention connections, forcing the model to predict with incomplete context
 
-TODO
+**Note**: During evaluation, `randmask_ratio` is automatically set to 0.0 to ensure deterministic behavior.
+
+### Left-to-Right Masking on MDM
+
+This experiment tests whether adding left-to-right (AR-style) masking to masked diffusion models can improve training efficiency under data constraints. By mixing random masking (standard diffusion) with left-to-right masking (AR-style), we study whether combining both masking strategies benefits the model.
+
+**The only difference between this script and the standard training script is the addition of arguments below (under GPT_ARGS):**
+- `--ar-ratio` (float, default=0.0): Probability ratio for applying left-to-right masking instead of random masking
+
+**Training Process:**
+When `ar_ratio > 0`, during each training step:
+- First generates random masking pattern as in standard masked diffusion (based on `p_mask`)
+- For each sample in the batch, with probability `ar_ratio`, converts the random masking to left-to-right masking
+- Creates a mixed training strategy where some samples use random masking (diffusion-style) and others use left-to-right masking (AR-style)
 
 
 
